@@ -873,8 +873,8 @@ async function refresh() {
 $("refresh").onclick = refresh;
 $("install").onclick = async () => { const r = await api("/api/install-codex", { method:"POST" }); log(r.message); await refresh(); };
 $("uninstall").onclick = async () => {
-  if (!confirm("确定要恢复官方 OpenAI 配置吗？\n\n当前配置会备份到 data/ 目录，之后可以手动恢复。")) return;
-  const r = await api("/api/uninstall-codex", { method:"POST" }); log(r.message + "\n备份: " + r.backupPath); await refresh();
+  if (!confirm("确定要恢复官方 OpenAI 配置吗？\\n\\n当前配置会备份到 data/ 目录，之后可以手动恢复。")) return;
+  const r = await api("/api/uninstall-codex", { method:"POST" }); log(r.message + "\\n备份: " + r.backupPath); await refresh();
 };
 $("testActive").onclick = async () => {
   log("正在测试当前厂商...");
