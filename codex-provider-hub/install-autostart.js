@@ -28,6 +28,40 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function pidFilePath() {
+  return path.join(appDataDir(), "hub.pid");
+}
+
+function readPid() {
+  try {
+    const content = fs.readFileSync(pidFilePath(), "utf8").trim();
+    const pid = parseInt(content, 10);
+    return isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+function writePid(pid) {
+  ensureDir(appDataDir());
+  fs.writeFileSync(pidFilePath(), String(pid));
+}
+
+function removePid() {
+  try { fs.unlinkSync(pidFilePath()); } catch {}
+}
+
+function isProcessRunning(pid) {
+  if (!pid) return false;
+  try {
+    // kill -0 checks if process exists without sending a signal
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function macPlistPath() {
   return path.join(os.homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 }
@@ -82,30 +116,128 @@ function macStart() {
   }
 }
 
+function windowsStart() {
+  const dataDir = appDataDir();
+  ensureDir(dataDir);
+  
+  // Check if already running
+  const existingPid = readPid();
+  if (existingPid && isProcessRunning(existingPid)) {
+    console.log(`Hub is already running (PID: ${existingPid})`);
+    return;
+  }
+  
+  // Start the hub process
+  const child = childProcess.spawn(NODE, [HUB], {
+    cwd: ROOT,
+    env: { ...process.env, CODEX_PROVIDER_HUB_DATA_DIR: dataDir },
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore"],
+    windowsHide: true
+  });
+  
+  child.unref();
+  writePid(child.pid);
+  console.log(`Hub started (PID: ${child.pid})`);
+}
+
+function windowsStop() {
+  const pid = readPid();
+  if (!pid) {
+    console.log("No PID file found. Hub may not be running.");
+    removePid();
+    return;
+  }
+  
+  if (!isProcessRunning(pid)) {
+    console.log(`Process ${pid} is not running. Cleaning up PID file.`);
+    removePid();
+    return;
+  }
+  
+  try {
+    // Use taskkill with specific PID instead of killing all node.exe
+    const result = run("taskkill", ["/PID", String(pid), "/T", "/F"]);
+    if (result.status === 0) {
+      console.log(`Hub stopped (PID: ${pid})`);
+    } else {
+      console.error(`Failed to stop hub: ${result.stderr || result.stdout}`);
+    }
+  } catch (err) {
+    console.error(`Error stopping hub: ${err.message}`);
+  } finally {
+    removePid();
+  }
+}
+
 function windowsStartupPath() {
   return path.join(process.env.APPDATA || os.homedir(), "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Codex Provider Hub.cmd");
 }
 
-function windowsStart() {
+function windowsInstallStartup() {
   const startup = windowsStartupPath();
+  const dataDir = appDataDir();
   ensureDir(path.dirname(startup));
-  fs.writeFileSync(startup, `@echo off\r\nset "CODEX_PROVIDER_HUB_DATA_DIR=${appDataDir()}"\r\ncd /d "${ROOT}"\r\nstart "" /min "${NODE}" "${HUB}"\r\n`);
-  childProcess.spawn(NODE, [HUB], {
-    cwd: ROOT,
-    env: { ...process.env, CODEX_PROVIDER_HUB_DATA_DIR: appDataDir() },
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  }).unref();
+  
+  const cmdContent = [
+    "@echo off",
+    `set "CODEX_PROVIDER_HUB_DATA_DIR=${dataDir}"`,
+    `cd /d "${ROOT}"`,
+    `if not exist "${pidFilePath()}" (`,
+    `  start "" /min "${NODE}" "${HUB}"`,
+    ")",
+    ""
+  ].join("\r\n");
+  
+  fs.writeFileSync(startup, cmdContent);
+  console.log("Startup script installed:", startup);
 }
 
 function linuxStart() {
-  childProcess.spawn(NODE, [HUB], {
+  const dataDir = appDataDir();
+  ensureDir(dataDir);
+  
+  // Check if already running
+  const existingPid = readPid();
+  if (existingPid && isProcessRunning(existingPid)) {
+    console.log(`Hub is already running (PID: ${existingPid})`);
+    return;
+  }
+  
+  const child = childProcess.spawn(NODE, [HUB], {
     cwd: ROOT,
-    env: { ...process.env, CODEX_PROVIDER_HUB_DATA_DIR: appDataDir() },
+    env: { ...process.env, CODEX_PROVIDER_HUB_DATA_DIR: dataDir },
     detached: true,
-    stdio: "ignore"
-  }).unref();
+    stdio: ["ignore", "ignore", "ignore"]
+  });
+  
+  child.unref();
+  writePid(child.pid);
+  console.log(`Hub started (PID: ${child.pid})`);
+}
+
+function linuxStop() {
+  const pid = readPid();
+  if (!pid) {
+    console.log("No PID file found. Hub may not be running.");
+    removePid();
+    return;
+  }
+  
+  if (!isProcessRunning(pid)) {
+    console.log(`Process ${pid} is not running. Cleaning up PID file.`);
+    removePid();
+    return;
+  }
+  
+  try {
+    process.kill(pid, "SIGTERM");
+    console.log(`Hub stopped (PID: ${pid})`);
+  } catch (err) {
+    console.error(`Error stopping hub: ${err.message}`);
+  } finally {
+    removePid();
+  }
 }
 
 function start() {
@@ -119,16 +251,38 @@ function stop() {
   if (process.platform === "darwin") {
     run("launchctl", ["bootout", `gui/${os.userInfo().uid}/${LABEL}`]);
   } else if (process.platform === "win32") {
-    run("taskkill", ["/IM", "node.exe", "/FI", `WINDOWTITLE eq ${LABEL}`, "/F"]);
+    windowsStop();
+  } else {
+    linuxStop();
   }
   console.log("Codex Provider Hub stop requested.");
+}
+
+function status() {
+  const pid = readPid();
+  if (!pid) {
+    console.log("Hub is not running (no PID file)");
+    return;
+  }
+  
+  if (isProcessRunning(pid)) {
+    console.log(`Hub is running (PID: ${pid})`);
+  } else {
+    console.log(`Hub is not running (stale PID file: ${pid})`);
+    removePid();
+  }
 }
 
 const cmd = process.argv[2] || "start";
 try {
   if (cmd === "start") start();
   else if (cmd === "stop") stop();
-  else throw new Error("usage: install-autostart.js start|stop");
+  else if (cmd === "status") status();
+  else if (cmd === "install-startup") {
+    if (process.platform === "win32") windowsInstallStartup();
+    else console.log("Startup installation is only supported on Windows.");
+  }
+  else throw new Error("usage: install-autostart.js [start|stop|status|install-startup]");
 } catch (error) {
   console.error(error.message);
   process.exit(1);

@@ -33,6 +33,20 @@ function appDataDir() {
 }
 
 const DATA_DIR = appDataDir();
+
+function hubPidFilePath() {
+  return path.join(DATA_DIR, "hub.pid");
+}
+
+function writeHubPid() {
+  ensureDir(DATA_DIR);
+  fs.writeFileSync(hubPidFilePath(), String(process.pid));
+}
+
+function removeHubPid() {
+  try { fs.unlinkSync(hubPidFilePath()); } catch {}
+}
+
 const CONFIG_PATH = path.join(DATA_DIR, "providers.json");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
 const LOG_PATH = path.join(DATA_DIR, "hub.log");
@@ -924,10 +938,11 @@ const uiServer = http.createServer(async (req, res) => {
   }
 });
 
-process.on("SIGINT", () => { stopAdapter(); process.exit(0); });
-process.on("SIGTERM", () => { stopAdapter(); process.exit(0); });
+process.on("SIGINT", () => { stopAdapter(); removeHubPid(); process.exit(0); });
+process.on("SIGTERM", () => { stopAdapter(); removeHubPid(); process.exit(0); });
 
 loadConfig();
+writeHubPid();
 apiServer.listen(API_PORT, API_HOST, () => {
   console.log(`Codex Provider Hub API: http://${API_HOST}:${API_PORT}/v1`);
 });

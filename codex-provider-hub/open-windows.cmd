@@ -1,14 +1,40 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
+
 cd /d "%~dp0"
 set "CODEX_PROVIDER_HUB_DATA_DIR=%~dp0..\data"
+set "PID_FILE=%CODEX_PROVIDER_HUB_DATA_DIR%\hub.pid"
 
+:: Install dependencies if needed
 if not exist node_modules (
-  npm install
+  echo Installing dependencies...
+  call npm install
+  if errorlevel 1 (
+    echo Failed to install dependencies.
+    pause
+    exit /b 1
+  )
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p = Get-NetTCPConnection -LocalPort 8789 -State Listen -ErrorAction SilentlyContinue; if (-not $p) { Start-Process -WindowStyle Hidden node -ArgumentList 'install-autostart.js start' -WorkingDirectory '%cd%' }"
+:: Check if hub is already running
+if exist "%PID_FILE%" (
+  set /p PID=<"%PID_FILE%"
+  tasklist /FI "PID eq !PID!" 2>nul | findstr /I "node.exe" >nul
+  if !errorlevel! equ 0 (
+    echo Hub is already running (PID: !PID!).
+    start http://127.0.0.1:8790
+    exit /b 0
+  )
+)
 
-timeout /t 1 /nobreak > nul
+:: Start the hub
+echo Starting Codex Provider Hub...
+start "" /min node "%~dp0hub.js"
+
+:: Wait for hub to start
+timeout /t 2 /nobreak > nul
+
+:: Open the control panel
 start http://127.0.0.1:8790
+
+echo Codex Provider Hub started.
