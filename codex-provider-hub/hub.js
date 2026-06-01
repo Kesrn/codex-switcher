@@ -550,6 +550,40 @@ request_max_retries = 1`;
   saveConfig(config);
 }
 
+function restoreOpenAIConfig() {
+  ensureDir(CODEX_DIR);
+  const existing = fs.existsSync(CODEX_CONFIG_PATH) ? readText(CODEX_CONFIG_PATH) : "";
+  
+  // Backup current config
+  const backupPath = path.join(DATA_DIR, `config-backup-${Date.now()}.toml`);
+  ensureDir(DATA_DIR);
+  fs.writeFileSync(backupPath, existing);
+  appendLog("config backed up", { path: backupPath });
+  
+  // Remove provider-hub section
+  const escaped = "model_providers.provider-hub".replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionRe = new RegExp(`(^|\\n)\[${escaped}\]\\n[\\s\\S]*?(?=\\n\[|$)`);
+  let cleaned = existing.replace(sectionRe, "$1").replace(/\n{3,}/g, "\n\n").replace(/\s+$/u, "") + "\n";
+  
+  // Restore official OpenAI settings
+  const next = setTopLevel(cleaned, {
+    model_provider: "\"openai\"",
+    model: "\"o3\"",
+    model_reasoning_effort: "\"high\""
+  }, []);
+  
+  fs.writeFileSync(CODEX_CONFIG_PATH, next);
+  chmodPrivate(CODEX_CONFIG_PATH);
+  
+  // Update hub config
+  const config = loadConfig();
+  config.codexInstalled = false;
+  saveConfig(config);
+  
+  return backupPath;
+}
+
+
 function splitToml(text) {
   const lines = text.split(/\r?\n/);
   const firstSection = lines.findIndex((line) => /^\s*\[/.test(line));
@@ -688,6 +722,11 @@ async function handleApi(req, res) {
     });
     return;
   }
+  if (req.method === "POST" && req.url === "/api/uninstall-codex") {
+    const backupPath = restoreOpenAIConfig();
+    sendJson(res, 200, { ok: true, message: "已恢复官方 OpenAI 配置。请重启 Codex。", backupPath });
+    return;
+  }
   sendJson(res, 404, { ok: false, message: "Not found" });
 }
 
@@ -753,6 +792,7 @@ function html() {
         <dt>Adapter</dt><dd id="adapter">-</dd>
       </dl>
       <div class="row"><button id="install">安装到 Codex</button><button class="secondary" id="testActive">测试当前厂商</button><button class="light" id="refresh">刷新</button></div>
+      <div class="row"><button class="light" id="uninstall" style="color:#b45309;border-color:#f0cf9d;">恢复官方配置</button></div>
       <div class="notice">第一次安装后需要重启 Codex。之后切换厂商通常不需要重启 Codex。</div>
     </div>
     <div class="panel">
@@ -818,6 +858,10 @@ async function refresh() {
 }
 $("refresh").onclick = refresh;
 $("install").onclick = async () => { const r = await api("/api/install-codex", { method:"POST" }); log(r.message); await refresh(); };
+$("uninstall").onclick = async () => {
+  if (!confirm("确定要恢复官方 OpenAI 配置吗？\n\n当前配置会备份到 data/ 目录，之后可以手动恢复。")) return;
+  const r = await api("/api/uninstall-codex", { method:"POST" }); log(r.message + "\n备份: " + r.backupPath); await refresh();
+};
 $("testActive").onclick = async () => {
   log("正在测试当前厂商...");
   const r = await api("/api/test-active", { method:"POST" });
