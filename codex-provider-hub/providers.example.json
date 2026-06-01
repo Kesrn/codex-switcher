@@ -1,0 +1,37 @@
+{
+  "activeProvider": "mimo",
+  "codexInstalled": false,
+  "localSearch": {
+    "enabled": true,
+    "provider": "duckduckgo",
+    "onlyWhenLikelyNeeded": true
+  },
+  "providers": [
+    {
+      "id": "mimo",
+      "type": "mimo",
+      "displayName": "MiMo v2.5 Pro",
+      "model": "mimo-v2.5-pro",
+      "baseUrl": "https://api.xiaomimimo.com/v1",
+      "keyId": "mimo",
+      "contextWindow": 1000000,
+      "maxOutputTokens": 131072
+    },
+    {
+      "id": "qwen",
+      "type": "openai-chat",
+      "displayName": "Qwen",
+      "model": "qwen3-coder-plus",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "keyId": "qwen"
+    },
+    {
+      "id": "openai-native",
+      "type": "responses",
+      "displayName": "OpenAI Responses",
+      "model": "gpt-5",
+      "baseUrl": "https://api.openai.com",
+      "keyId": "openai"
+    }
+  ]
+}

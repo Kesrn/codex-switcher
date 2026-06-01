@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Runtime data and secrets
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Logs
+*.log
+*.out
+*.err
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Local archives and scratch
+archive/
+legacy/
+.tmp/
