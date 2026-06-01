@@ -675,13 +675,16 @@ async function handleApi(req, res) {
   if (req.method === "POST" && req.url === "/api/providers") {
     const body = await readJsonBody(req);
     const config = loadConfig();
+    const id = String(body.id || "").trim();
+    const existingProvider = providerById(config, id);
     const provider = {
-      id: String(body.id || "").trim(),
+      ...existingProvider,
+      id,
       displayName: String(body.displayName || body.id || "").trim(),
       type: body.type || "openai-chat",
       baseUrl: String(body.baseUrl || "").trim(),
       model: String(body.model || "").trim(),
-      keyId: String(body.id || "").trim()
+      keyId: existingProvider?.keyId || id
     };
     if (!provider.id || !provider.baseUrl || !provider.model) {
       sendJson(res, 400, { ok: false, message: "id, baseUrl, and model are required." });
@@ -822,15 +825,15 @@ function html() {
       <div class="providers" id="providers"></div>
     </div>
     <div class="panel wide">
-      <h2>添加自定义 OpenAI 兼容厂商</h2>
+      <h2 id="providerFormTitle">添加自定义 OpenAI 兼容厂商</h2>
       <form id="providerForm">
         <label>ID<input name="id" placeholder="qwen"></label>
         <label>显示名<input name="displayName" placeholder="Qwen"></label>
         <label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option></select></label>
         <label>模型<input name="model" placeholder="qwen3-coder-plus"></label>
         <label class="full">Base URL<input name="baseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"></label>
-        <label class="full">API Key<input name="apiKey" type="password" placeholder="只保存在本机"></label>
-        <div class="row full"><button>保存厂商</button></div>
+        <label class="full">API Key<input name="apiKey" type="password" placeholder="留空则沿用已保存密钥"></label>
+        <div class="row full"><button id="saveProvider">保存厂商</button><button type="button" class="light" id="clearProviderForm">新增厂商</button></div>
       </form>
       <pre id="log" hidden></pre>
     </div>
@@ -867,8 +870,32 @@ async function refresh() {
     btn.disabled = p.id === lastStatus.activeProvider;
     btn.onclick = async () => { await api("/api/switch", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify({ id:p.id }) }); await refresh(); };
     el.querySelector(".row").append(btn);
+    const editBtn = document.createElement("button");
+    editBtn.className = "light";
+    editBtn.textContent = "编辑";
+    editBtn.onclick = () => fillProviderForm(p);
+    el.querySelector(".row").append(editBtn);
     $("providers").append(el);
   }
+}
+function fillProviderForm(provider) {
+  const form = $("providerForm");
+  form.elements.id.value = provider.id || "";
+  form.elements.displayName.value = provider.displayName || provider.id || "";
+  form.elements.type.value = provider.type || "openai-chat";
+  form.elements.model.value = provider.model || "";
+  form.elements.baseUrl.value = provider.baseUrl || "";
+  form.elements.apiKey.value = "";
+  $("providerFormTitle").textContent = "编辑已保存厂商";
+  $("saveProvider").textContent = "保存修改";
+  log((provider.displayName || provider.id) + " 已载入表单。API Key 留空会继续使用本机已保存密钥。");
+  form.scrollIntoView({ behavior:"smooth", block:"start" });
+}
+function resetProviderForm() {
+  const form = $("providerForm");
+  form.reset();
+  $("providerFormTitle").textContent = "添加自定义 OpenAI 兼容厂商";
+  $("saveProvider").textContent = "保存厂商";
 }
 $("refresh").onclick = refresh;
 $("install").onclick = async () => { const r = await api("/api/install-codex", { method:"POST" }); log(r.message); await refresh(); };
@@ -892,9 +919,10 @@ $("providerForm").onsubmit = async (event) => {
   const data = Object.fromEntries(new FormData(event.currentTarget).entries());
   const r = await api("/api/providers", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify(data) });
   log("已保存：" + (r.provider.displayName || r.provider.id));
-  event.currentTarget.reset();
+  resetProviderForm();
   await refresh();
 };
+$("clearProviderForm").onclick = resetProviderForm;
 refresh().catch((error) => log(error.message));
 setInterval(() => refresh().catch(() => {}), 5000);
 </script>
