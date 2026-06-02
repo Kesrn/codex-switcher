@@ -7,17 +7,19 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const childProcess = require("child_process");
+const crypto = require("crypto");
+const { pathToFileURL } = require("url");
 
 const ROOT = __dirname;
 const API_HOST = "127.0.0.1";
 const API_PORT = Number(process.env.CODEX_PROVIDER_HUB_API_PORT || 8789);
 const UI_PORT = Number(process.env.CODEX_PROVIDER_HUB_UI_PORT || 8790);
 const ADAPTER_PORT = Number(process.env.CODEX_PROVIDER_HUB_ADAPTER_PORT || 8791);
-const LOCAL_AUTH_TOKEN = "provider-hub-local";
 const MAX_BODY = 12 * 1024 * 1024;
 const OLD_ROOT = path.resolve(ROOT, "..");
 const OLD_MIMO_ENV = path.join(OLD_ROOT, ".mimo2codex-data", ".env");
 const OLD_MIMO_BIN = path.join(OLD_ROOT, ".tools", "mimo2codex", "node_modules", "mimo2codex", "dist", "cli.js");
+const PROVIDER_TYPES = new Set(["mimo", "openai-chat", "responses"]);
 
 function appDataDir() {
   if (process.env.CODEX_PROVIDER_HUB_DATA_DIR) return process.env.CODEX_PROVIDER_HUB_DATA_DIR;
@@ -49,8 +51,10 @@ function removeHubPid() {
 
 const CONFIG_PATH = path.join(DATA_DIR, "providers.json");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
+const AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token");
 const LOG_PATH = path.join(DATA_DIR, "hub.log");
 const ADAPTER_DATA_DIR = path.join(DATA_DIR, "mimo2codex");
+const ADAPTER_AUTH_TOKEN_PATH = path.join(ADAPTER_DATA_DIR, "hub-api-token");
 const CODEX_DIR = path.join(os.homedir(), ".codex");
 const CODEX_CONFIG_PATH = path.join(CODEX_DIR, "config.toml");
 const CODEX_AUTH_PATH = path.join(CODEX_DIR, "auth.json");
@@ -61,6 +65,13 @@ let adapterKey = null;
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function ensurePrivateDir(dir) {
+  ensureDir(dir);
+  if (process.platform !== "win32") {
+    try { fs.chmodSync(dir, 0o700); } catch {}
+  }
 }
 
 function chmodPrivate(file) {
@@ -82,9 +93,75 @@ function readJson(file, fallback) {
 }
 
 function writeJson(file, data, privateFile = false) {
-  ensureDir(path.dirname(file));
+  if (privateFile) ensurePrivateDir(path.dirname(file));
+  else ensureDir(path.dirname(file));
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
   if (privateFile) chmodPrivate(file);
+}
+
+function isValidAuthToken(token) {
+  return /^[A-Za-z0-9_-]{32,}$/.test(token);
+}
+
+function generateAuthToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function localAuthToken() {
+  const envToken = String(process.env.CODEX_PROVIDER_HUB_AUTH_TOKEN || "").trim();
+  if (isValidAuthToken(envToken)) return envToken;
+  ensurePrivateDir(DATA_DIR);
+  let token = "";
+  try { token = readText(AUTH_TOKEN_PATH).trim(); } catch {}
+  if (!isValidAuthToken(token)) {
+    token = generateAuthToken();
+    fs.writeFileSync(AUTH_TOKEN_PATH, `${token}\n`);
+  }
+  chmodPrivate(AUTH_TOKEN_PATH);
+  return token;
+}
+
+function bearerToken(req) {
+  const match = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+function timingSafeEqualText(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function hasValidAuth(req) {
+  return timingSafeEqualText(bearerToken(req), localAuthToken());
+}
+
+function requireAuth(req, res) {
+  if (hasValidAuth(req)) return true;
+  sendJson(res, 401, { error: { type: "unauthorized", message: "Missing or invalid local auth token." } });
+  return false;
+}
+
+function trustedUiOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    const hostname = url.hostname.toLowerCase();
+    const port = Number(url.port || "80");
+    return url.protocol === "http:" && port === UI_PORT && ["127.0.0.1", "localhost", "[::1]"].includes(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function requireUiApiAccess(req, res) {
+  if (!requireAuth(req, res)) return false;
+  if (!["GET", "HEAD"].includes(req.method) && !trustedUiOrigin(req)) {
+    sendJson(res, 403, { ok: false, message: "Cross-origin local API request rejected." });
+    return false;
+  }
+  return true;
 }
 
 function appendLog(message, extra) {
@@ -161,6 +238,7 @@ function loadConfig() {
     mimo.baseUrl = oldEnv.MIMO_BASE_URL;
     saveConfig(config);
   }
+  syncCodexAuthToken(config);
   return config;
 }
 
@@ -170,6 +248,19 @@ function saveConfig(config) {
 
 function loadKeys() {
   return readJson(KEYS_PATH, {});
+}
+
+function writeCodexAuthToken(token) {
+  const auth = readJson(CODEX_AUTH_PATH, {});
+  auth.OPENAI_API_KEY = token;
+  writeJson(CODEX_AUTH_PATH, auth, true);
+}
+
+function syncCodexAuthToken(config) {
+  if (!config.codexInstalled) return;
+  const token = localAuthToken();
+  const auth = readJson(CODEX_AUTH_PATH, {});
+  if (auth.OPENAI_API_KEY !== token) writeCodexAuthToken(token);
 }
 
 function providerById(config, id = config.activeProvider) {
@@ -189,6 +280,68 @@ function redactedProvider(provider) {
     hasKey: !!providerKey(provider),
     apiKey: provider.apiKey ? "***" : undefined
   };
+}
+
+function normalizeProviderType(type) {
+  const normalized = String(type || "").trim();
+  return PROVIDER_TYPES.has(normalized) ? normalized : "";
+}
+
+function normalizeHostname(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  if (host.startsWith("[") && host.endsWith("]")) return host.slice(1, -1);
+  return host;
+}
+
+function isPrivateIpv4(host) {
+  const parts = host.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const [a, b] = parts;
+  return a === 0
+    || a === 10
+    || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || a >= 224;
+}
+
+function isBlockedProviderHost(hostname) {
+  const host = normalizeHostname(hostname);
+  if (!host) return true;
+  if (["localhost", "localhost.localdomain"].includes(host) || host.endsWith(".localhost")) return true;
+  if (host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".lan") || host.endsWith(".home")) return true;
+  const ipVersion = net.isIP(host);
+  if (ipVersion === 4) return isPrivateIpv4(host);
+  if (ipVersion === 6) {
+    if (host === "::" || host === "::1" || host.startsWith("fc") || host.startsWith("fd") || /^fe[89ab][0-9a-f]?:/i.test(host)) return true;
+    if (host.startsWith("::ffff:")) return isPrivateIpv4(host.slice(7));
+    return false;
+  }
+  return !host.includes(".");
+}
+
+function validateProviderBaseUrl(baseUrl) {
+  let url;
+  try {
+    url = new URL(String(baseUrl || "").trim());
+  } catch {
+    return { ok: false, message: "Base URL must be a valid URL." };
+  }
+  if (url.protocol !== "https:") return { ok: false, message: "Base URL must use https://." };
+  if (url.username || url.password) return { ok: false, message: "Base URL must not include credentials." };
+  if (url.search || url.hash) return { ok: false, message: "Base URL must not include query strings or fragments." };
+  if (isBlockedProviderHost(url.hostname)) return { ok: false, message: "Base URL host must be a public provider host." };
+  return { ok: true, url };
+}
+
+function assertProviderBaseUrl(provider) {
+  const validation = validateProviderBaseUrl(provider?.baseUrl);
+  if (!validation.ok) {
+    throw new Error(`Invalid Base URL for ${provider?.displayName || provider?.id || "provider"}: ${validation.message}`);
+  }
+  return validation.url;
 }
 
 function readRequestBody(req) {
@@ -396,8 +549,16 @@ function buildUrl(baseUrl, suffix) {
 
 function proxyHttp(url, req, res, body, headers = {}) {
   const target = new URL(url);
+  if (!["http:", "https:"].includes(target.protocol)) {
+    throw new Error(`Unsupported upstream protocol: ${target.protocol}`);
+  }
   const transport = target.protocol === "https:" ? https : http;
-  const outgoingHeaders = { ...req.headers, ...headers, host: target.host };
+  const outgoingHeaders = {
+    "content-type": req.headers["content-type"] || "application/json",
+    accept: req.headers.accept || "application/json",
+    ...headers,
+    host: target.host
+  };
   outgoingHeaders["content-length"] = Buffer.byteLength(body);
   const upstream = transport.request({
     method: req.method,
@@ -418,6 +579,44 @@ function findMimo2CodexCli() {
   if (fs.existsSync(local)) return local;
   if (fs.existsSync(OLD_MIMO_BIN)) return OLD_MIMO_BIN;
   return null;
+}
+
+function isValidAdapterAuthToken(token) {
+  return /^m2c_[a-f0-9]{64}$/i.test(String(token || "").trim());
+}
+
+function mimoDistUrl(relativePath) {
+  return pathToFileURL(path.join(ROOT, "node_modules", "mimo2codex", "dist", relativePath)).href;
+}
+
+async function ensureAdapterAuthToken() {
+  ensurePrivateDir(ADAPTER_DATA_DIR);
+  const [{ openDb, closeDb }, { createUser, findUserByUsername }, { createApiKey, findApiKeyByToken }] = await Promise.all([
+    import(mimoDistUrl("db/index.js")),
+    import(mimoDistUrl("db/users.js")),
+    import(mimoDistUrl("db/apiKeys.js"))
+  ]);
+  openDb(ADAPTER_DATA_DIR);
+  try {
+    let token = "";
+    try { token = readText(ADAPTER_AUTH_TOKEN_PATH).trim(); } catch {}
+    if (isValidAdapterAuthToken(token) && findApiKeyByToken(token)) {
+      chmodPrivate(ADAPTER_AUTH_TOKEN_PATH);
+      return token;
+    }
+    const user = findUserByUsername("provider-hub") || createUser({
+      username: "provider-hub",
+      displayName: "Provider Hub",
+      passwordHash: null,
+      isAdmin: true
+    });
+    const created = createApiKey(user.id, "Provider Hub adapter");
+    fs.writeFileSync(ADAPTER_AUTH_TOKEN_PATH, `${created.token}\n`);
+    chmodPrivate(ADAPTER_AUTH_TOKEN_PATH);
+    return created.token;
+  } finally {
+    closeDb();
+  }
 }
 
 function adapterSignature(provider) {
@@ -465,9 +664,11 @@ async function ensureAdapter(provider) {
   const sig = adapterSignature(provider);
   if (adapter?.process && !adapter.process.killed && adapterKey === sig && await canConnect(ADAPTER_PORT)) return;
   stopAdapter();
+  assertProviderBaseUrl(provider);
   const cli = findMimo2CodexCli();
   if (!cli) throw new Error("mimo2codex is not installed. Run npm install in codex-provider-hub.");
   ensureDir(ADAPTER_DATA_DIR);
+  const adapterAuthToken = await ensureAdapterAuthToken();
   const key = providerKey(provider);
   if (!key) throw new Error(`Provider ${provider.displayName || provider.id} has no API key.`);
   const env = {
@@ -476,7 +677,8 @@ async function ensureAdapter(provider) {
     MIMO2CODEX_PORT: String(ADAPTER_PORT),
     MIMO2CODEX_DATA_DIR: ADAPTER_DATA_DIR,
     MIMO2CODEX_NO_UPDATE_CHECK: "1",
-    MIMO2CODEX_DISABLE_WEB_SEARCH: "1"
+    MIMO2CODEX_DISABLE_WEB_SEARCH: "1",
+    MIMO2CODEX_AUTH: "on"
   };
   const args = [cli, "--data-dir", ADAPTER_DATA_DIR, "--port", String(ADAPTER_PORT), "--host", API_HOST, "--no-update-check"];
   if (provider.type === "mimo") {
@@ -497,7 +699,7 @@ async function ensureAdapter(provider) {
     stdio: ["ignore", out, err],
     windowsHide: true
   });
-  adapter = { process: child, providerId: provider.id };
+  adapter = { process: child, providerId: provider.id, authToken: adapterAuthToken };
   adapterKey = sig;
   appendLog("adapter started", { provider: provider.id, pid: child.pid });
   child.on("exit", (code, signal) => appendLog("adapter exited", { provider: provider.id, code, signal }));
@@ -525,6 +727,7 @@ async function handleResponses(req, res) {
   payload = await applyLocalSearch(payload, config);
 
   if (provider.type === "responses") {
+    assertProviderBaseUrl(provider);
     const key = providerKey(provider);
     if (!key) {
       sendJson(res, 400, { error: { type: "provider_hub_error", message: `Provider ${provider.displayName || provider.id} has no API key.` } });
@@ -538,7 +741,7 @@ async function handleResponses(req, res) {
 
   await ensureAdapter(provider);
   proxyHttp(`http://${API_HOST}:${ADAPTER_PORT}/v1/responses`, req, res, JSON.stringify(payload), {
-    authorization: "Bearer mimo2codex-local"
+    authorization: `Bearer ${adapter.authToken}`
   });
 }
 
@@ -558,7 +761,7 @@ request_max_retries = 1`;
   }, ["model_context_window", "model_max_output_tokens"]);
   fs.writeFileSync(CODEX_CONFIG_PATH, next);
   chmodPrivate(CODEX_CONFIG_PATH);
-  writeJson(CODEX_AUTH_PATH, { OPENAI_API_KEY: LOCAL_AUTH_TOKEN }, true);
+  writeCodexAuthToken(localAuthToken());
   const config = loadConfig();
   config.codexInstalled = true;
   saveConfig(config);
@@ -623,8 +826,17 @@ function upsertSection(text, sectionName, block) {
   return text.replace(/\s+$/u, "") + "\n\n" + block + "\n";
 }
 
+function securityHeaders(extra = {}) {
+  return {
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    ...extra
+  };
+}
+
 function sendJson(res, status, payload) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.writeHead(status, securityHeaders({ "content-type": "application/json; charset=utf-8" }));
   res.end(JSON.stringify(payload));
 }
 
@@ -676,18 +888,32 @@ async function handleApi(req, res) {
     const body = await readJsonBody(req);
     const config = loadConfig();
     const id = String(body.id || "").trim();
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(id)) {
+      sendJson(res, 400, { ok: false, message: "Provider id must be 1-64 characters: letters, numbers, dot, underscore, or hyphen." });
+      return;
+    }
     const existingProvider = providerById(config, id);
+    const type = normalizeProviderType(body.type || existingProvider?.type || "openai-chat");
+    if (!type) {
+      sendJson(res, 400, { ok: false, message: "Provider type must be mimo, openai-chat, or responses." });
+      return;
+    }
     const provider = {
       ...existingProvider,
       id,
       displayName: String(body.displayName || body.id || "").trim(),
-      type: body.type || "openai-chat",
+      type,
       baseUrl: String(body.baseUrl || "").trim(),
       model: String(body.model || "").trim(),
       keyId: existingProvider?.keyId || id
     };
     if (!provider.id || !provider.baseUrl || !provider.model) {
       sendJson(res, 400, { ok: false, message: "id, baseUrl, and model are required." });
+      return;
+    }
+    const baseUrlValidation = validateProviderBaseUrl(provider.baseUrl);
+    if (!baseUrlValidation.ok) {
+      sendJson(res, 400, { ok: false, message: baseUrlValidation.message });
       return;
     }
     config.providers = config.providers.filter((item) => item.id !== provider.id);
@@ -719,7 +945,7 @@ async function handleApi(req, res) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${LOCAL_AUTH_TOKEN}`
+        authorization: `Bearer ${localAuthToken()}`
       },
       body: JSON.stringify({
         model: "current",
@@ -841,10 +1067,12 @@ function html() {
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
+const AUTH_TOKEN = ${JSON.stringify(localAuthToken())};
 let lastStatus = null;
 function log(text) { $("log").hidden = false; $("log").textContent = text; }
-async function api(path, opts) {
-  const res = await fetch(path, { cache:"no-store", ...opts });
+async function api(path, opts = {}) {
+  const headers = { authorization:"Bearer " + AUTH_TOKEN, ...(opts.headers || {}) };
+  const res = await fetch(path, { cache:"no-store", ...opts, headers });
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.message || data.error?.message || "request failed");
   return data;
@@ -932,6 +1160,7 @@ setInterval(() => refresh().catch(() => {}), 5000);
 
 const apiServer = http.createServer(async (req, res) => {
   try {
+    if (!requireAuth(req, res)) return;
     const config = loadConfig();
     if (req.method === "GET" && req.url === "/v1/models") {
       sendJson(res, 200, modelsResponse(config));
@@ -951,11 +1180,15 @@ const apiServer = http.createServer(async (req, res) => {
 const uiServer = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/") {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      res.writeHead(200, securityHeaders({
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+      }));
       res.end(html());
       return;
     }
     if (req.url.startsWith("/api/")) {
+      if (!requireUiApiAccess(req, res)) return;
       await handleApi(req, res);
       return;
     }

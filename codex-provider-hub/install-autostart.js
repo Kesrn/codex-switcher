@@ -28,6 +28,19 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function xmlEscape(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function cmdEscape(value) {
+  return String(value).replace(/%/g, "%%").replace(/[\r\n]/g, "");
+}
+
 function pidFilePath() {
   return path.join(appDataDir(), "hub.pid");
 }
@@ -75,27 +88,27 @@ function macPlist() {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${xmlEscape(LABEL)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${NODE}</string>
-    <string>${HUB}</string>
+    <string>${xmlEscape(NODE)}</string>
+    <string>${xmlEscape(HUB)}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>WorkingDirectory</key>
-  <string>${ROOT}</string>
+  <string>${xmlEscape(ROOT)}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>CODEX_PROVIDER_HUB_DATA_DIR</key>
-    <string>${dataDir}</string>
+    <string>${xmlEscape(dataDir)}</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>${path.join(dataDir, "hub.out.log")}</string>
+  <string>${xmlEscape(path.join(dataDir, "hub.out.log"))}</string>
   <key>StandardErrorPath</key>
-  <string>${path.join(dataDir, "hub.err.log")}</string>
+  <string>${xmlEscape(path.join(dataDir, "hub.err.log"))}</string>
 </dict>
 </plist>
 `;
@@ -181,10 +194,10 @@ function windowsInstallStartup() {
   
   const cmdContent = [
     "@echo off",
-    `set "CODEX_PROVIDER_HUB_DATA_DIR=${dataDir}"`,
-    `cd /d "${ROOT}"`,
-    `if not exist "${pidFilePath()}" (`,
-    `  start "" /min "${NODE}" "${HUB}"`,
+    `set "CODEX_PROVIDER_HUB_DATA_DIR=${cmdEscape(dataDir)}"`,
+    `cd /d "${cmdEscape(ROOT)}"`,
+    `if not exist "${cmdEscape(pidFilePath())}" (`,
+    `  start "" /min "${cmdEscape(NODE)}" "${cmdEscape(HUB)}"`,
     ")",
     ""
   ].join("\r\n");
