@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, shell } = require("electron");
+const { app, BrowserWindow, Menu, Tray, nativeImage, shell } = require("electron");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -169,8 +169,13 @@ function createTray() {
   const icon = process.platform === "darwin" ? existingIcon("trayTemplate.png") : existingIcon("icon.png");
   try {
     if (!icon) return;
-    tray = new Tray(icon);
-    if (process.platform === "darwin") tray.setTemplateImage(true);
+    if (process.platform === "darwin") {
+      const image = nativeImage.createFromPath(icon).resize({ width: 18, height: 18 });
+      image.setTemplateImage(true);
+      tray = new Tray(image);
+    } else {
+      tray = new Tray(icon);
+    }
   } catch {
     return;
   }

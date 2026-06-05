@@ -13,6 +13,7 @@ const { pathToFileURL } = require("url");
 const ROOT = __dirname;
 const APP_ID = "cc.codex-switcher.app";
 const API_HOST = "127.0.0.1";
+const DEFAULT_CODEX_MODEL_ALIAS = "gpt-5.5";
 const API_PORT = Number(process.env.CODEX_PROVIDER_HUB_API_PORT || 8789);
 const UI_PORT = Number(process.env.CODEX_PROVIDER_HUB_UI_PORT || 8790);
 const ADAPTER_PORT = Number(process.env.CODEX_PROVIDER_HUB_ADAPTER_PORT || 8791);
@@ -221,13 +222,13 @@ function defaultConfig() {
       logRequestBody: false,
       maxRequestsPerMinute: 120,
       maxConcurrentConnections: 20,
+      codexModelAlias: DEFAULT_CODEX_MODEL_ALIAS,
       routes: [
         { inbound: "POST /v1/responses", mode: "protocol-convert", outbound: "POST /v1/responses", enabled: true },
         { inbound: "GET /v1/models", mode: "passthrough", outbound: "GET /v1/models", enabled: true }
       ],
       modelMappings: [
-        { input: "current", output: "<active provider model>", enabled: true },
-        { input: "provider id", output: "provider.model", enabled: true }
+        { input: "*", output: "provider.model", enabled: true }
       ]
     },
     providers: []
@@ -264,6 +265,7 @@ function normalizeGatewaySettings(settings = {}) {
     logRequestBody: settings.logRequestBody === true,
     maxRequestsPerMinute: numberInRange(settings.maxRequestsPerMinute, defaults.maxRequestsPerMinute, 1, 100000),
     maxConcurrentConnections: numberInRange(settings.maxConcurrentConnections, defaults.maxConcurrentConnections, 1, 10000),
+    codexModelAlias: String(settings.codexModelAlias || defaults.codexModelAlias).trim() || defaults.codexModelAlias,
     routes: Array.isArray(settings.routes) ? settings.routes.map((route) => ({
       inbound: String(route.inbound || ""),
       mode: String(route.mode || "protocol-convert"),
@@ -383,6 +385,7 @@ function providerKey(provider) {
 function redactedProvider(provider) {
   return {
     ...provider,
+    supportsMultimodal: provider.supportsMultimodal === true,
     hasKey: !!providerKey(provider),
     apiKey: provider.apiKey ? "***" : undefined
   };
@@ -632,19 +635,20 @@ async function applyLocalSearch(payload, config) {
 
 function modelsResponse(config) {
   const now = Math.floor(Date.now() / 1000);
-  const models = config.providers.map((provider) => ({
-    id: provider.model || provider.id,
+  const alias = codexModelAlias(config);
+  const models = [{
+    id: alias,
     object: "model",
     created: now,
     owned_by: "codex-provider-hub",
-    display_name: provider.displayName || provider.id
-  }));
-  models.unshift({
+    display_name: `${alias} (Codex Alias)`
+  }];
+  models.push({
     id: "current",
     object: "model",
     created: now,
     owned_by: "codex-provider-hub",
-    display_name: "Current Provider"
+    display_name: `${alias} compatible current provider`
   });
   return { object: "list", data: models };
 }
@@ -921,10 +925,61 @@ async function ensureAdapter(provider) {
   }
 }
 
-function rewriteModel(payload, provider) {
-  if (provider.model) {
-    payload.model = provider.model;
+function normalizeModelName(model) {
+  return String(model || "").trim().toLowerCase();
+}
+
+function resolveMappedModel(output, provider, incomingModel) {
+  const value = String(output || "").trim();
+  if (!value || value === "provider.model" || value === "<active provider model>") return provider.model || incomingModel;
+  if (value === "provider.id") return provider.id || incomingModel;
+  if (value === "incoming" || value === "request.model") return incomingModel || provider.model;
+  return value;
+}
+
+function modelMappingTarget(inputModel, provider, config) {
+  const normalizedInput = normalizeModelName(inputModel);
+  const normalizedAlias = normalizeModelName(codexModelAlias(config));
+  const mappings = config.gateway?.modelMappings || [];
+  for (const mapping of mappings) {
+    if (mapping.enabled === false) continue;
+    const mappingInput = normalizeModelName(mapping.input);
+    if (!mappingInput) continue;
+    const matchesProviderId = ["provider.id", "provider id"].includes(mappingInput) && normalizedInput === normalizeModelName(provider.id);
+    const matchesProviderModel = mappingInput === "provider.model" && normalizedInput === normalizeModelName(provider.model);
+    if (mappingInput === "*" || mappingInput === normalizedInput || matchesProviderId || matchesProviderModel) {
+      return resolveMappedModel(mapping.output, provider, inputModel);
+    }
   }
+  if (!inputModel || ["current", provider.id, normalizedAlias, "gpt-5", "gpt-5.1", "gpt-4.1", "o3"].includes(normalizedInput)) {
+    return provider.model || inputModel;
+  }
+  return provider.model || inputModel;
+}
+
+function codexModelAlias(config = loadConfig()) {
+  return String(config.gateway?.codexModelAlias || DEFAULT_CODEX_MODEL_ALIAS).trim() || DEFAULT_CODEX_MODEL_ALIAS;
+}
+
+function rewriteModel(payload, provider, config) {
+  payload.model = modelMappingTarget(payload.model, provider, config);
+}
+
+function payloadHasMultimodal(value) {
+  if (!value) return false;
+  if (Array.isArray(value)) return value.some(payloadHasMultimodal);
+  if (typeof value !== "object") return false;
+  const type = String(value.type || "").toLowerCase();
+  if (["input_image", "image_url", "image", "input_file", "file", "audio", "input_audio"].includes(type)) return true;
+  if (value.image_url || value.file_id || value.file_data || value.input_image || value.input_audio) return true;
+  if (typeof value.mime_type === "string" && /^(image|audio|video|application\/pdf)/i.test(value.mime_type)) return true;
+  return Object.values(value).some(payloadHasMultimodal);
+}
+
+function ensureMultimodalSupported(payload, provider) {
+  if (!payloadHasMultimodal(payload)) return;
+  if (provider.supportsMultimodal === true) return;
+  throw new Error(`当前厂商 ${provider.displayName || provider.id} 未开启多模态支持。请切换支持图片/文件输入的模型，或在厂商编辑中开启“支持多模态输入”。`);
 }
 
 async function prepareProviderForSwitch(provider) {
@@ -955,7 +1010,13 @@ async function handleResponses(req, res) {
   }
   const raw = await readRequestBody(req);
   let payload = JSON.parse(raw || "{}");
-  rewriteModel(payload, provider);
+  try {
+    ensureMultimodalSupported(payload, provider);
+  } catch (error) {
+    sendJson(res, 400, { error: { type: "provider_multimodal_not_supported", message: error.message } });
+    return;
+  }
+  rewriteModel(payload, provider, config);
   payload = await applyLocalSearch(payload, config);
 
   if (provider.type === "responses") {
@@ -993,7 +1054,7 @@ requires_openai_auth = true
 request_max_retries = 3`;
   const next = setTopLevel(upsertSection(existing, "model_providers.provider-hub", providerBlock), {
     model_provider: "\"provider-hub\"",
-    model: "\"current\"",
+    model: JSON.stringify(codexModelAlias(config)),
     model_reasoning_effort: "\"high\""
   }, ["model_context_window", "model_max_output_tokens"]);
   fs.writeFileSync(CODEX_CONFIG_PATH, next);
@@ -1251,6 +1312,7 @@ async function handleApi(req, res) {
       type,
       baseUrl: String(body.baseUrl || "").trim(),
       model: String(body.model || "").trim(),
+      supportsMultimodal: body.supportsMultimodal === true || body.supportsMultimodal === "on",
       keyId: existingProvider?.keyId || id
     };
     if (!provider.id || !provider.baseUrl || !provider.model) {
@@ -1302,7 +1364,7 @@ async function handleApi(req, res) {
         authorization: `Bearer ${localAuthToken()}`
       },
       body: JSON.stringify({
-        model: "current",
+        model: codexModelAlias(loadConfig()),
         input: "Reply with exactly: ok",
         stream: false
       })
@@ -1335,15 +1397,19 @@ function html({ desktopMac = false } = {}) {
 #page-providers .providers{grid-template-columns:1fr}
 #page-providers .provider{padding:16px 18px}
 #page-providers .provider:not(.compact){grid-template-columns:minmax(0,1fr) minmax(420px,520px);align-items:center}
-#page-providers .provider-main{display:grid;grid-template-columns:minmax(150px,220px) minmax(0,1fr) auto;grid-template-areas:"title meta actions" "url url actions";gap:8px 14px;align-items:center}
+#page-providers .provider-main{display:grid;grid-template-columns:minmax(220px,1fr) minmax(270px,max-content);grid-template-areas:"title meta" "url actions";gap:14px 22px;align-items:center;min-width:0}
 #page-providers .provider-main h3{grid-area:title;font-size:16px;line-height:1.2;overflow-wrap:anywhere}
-#page-providers .provider-main>.type:not(.url){grid-area:meta;margin-top:0;align-items:center}
+#page-providers .provider-main>.type:not(.url){grid-area:meta;margin-top:0;align-items:center;gap:8px;min-width:0}
+#page-providers .provider-main>.type .badge,#page-providers .provider-main>.type .code{white-space:nowrap;flex:0 0 auto}
+#page-providers .provider-main>.type .code{max-width:170px;overflow:hidden;text-overflow:ellipsis}
 #page-providers .provider-main>.url{grid-area:url;margin-top:0;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#page-providers .provider-main>.row{grid-area:actions;margin-top:0;justify-content:flex-end;flex-wrap:nowrap}
+#page-providers .provider-main>.row{grid-area:actions;margin-top:0;justify-content:flex-start;flex-wrap:nowrap}
+#page-providers .provider-main .btn{white-space:nowrap;min-width:92px;justify-content:center}
 #page-providers .provider-usage{grid-template-columns:minmax(110px,.65fr) minmax(280px,1.35fr);align-items:center}
 #page-providers .usage-grid{grid-template-columns:repeat(3,minmax(84px,1fr))}
 #page-providers .usage-mini{padding:8px 10px}
-@media(max-width:1100px){#page-providers .provider:not(.compact){grid-template-columns:1fr}#page-providers .provider-main{grid-template-columns:1fr;grid-template-areas:"title" "meta" "url" "actions"}#page-providers .provider-main>.row{justify-content:flex-start;flex-wrap:wrap}#page-providers .provider-usage{grid-template-columns:1fr;border-left:0;border-top:1px solid #e5e7eb;padding-left:0;padding-top:14px}}
+@media(max-width:1280px){#page-providers .provider:not(.compact){grid-template-columns:1fr}#page-providers .provider-main{grid-template-columns:1fr;grid-template-areas:"title" "meta" "url" "actions"}#page-providers .provider-main>.row{justify-content:flex-start;flex-wrap:wrap}#page-providers .provider-usage{grid-template-columns:1fr;border-left:0;border-top:1px solid #e5e7eb;padding-left:0;padding-top:14px}}
+@media(max-width:760px){#page-providers .provider-main>.type:not(.url){flex-wrap:wrap}#page-providers .provider-main>.type .code{max-width:100%}}
 </style>
 </head>
 <body class="${bodyClass}">
@@ -1371,10 +1437,10 @@ function html({ desktopMac = false } = {}) {
       </section>
       <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div id="providers" class="grid providers"></div></div></section>
       <section id="page-logs" class="page"><header class="page-header"><div><div class="page-title">运行日志</div><div class="page-sub">读取本地 data/hub.log，便于排查切换和适配器状态。</div></div><div class="actions"><button id="refreshLogs" class="btn btn-secondary">刷新日志</button></div></header><div class="page-body"><div id="logs" class="logbox">读取中...</div></div></section>
-      <section id="page-settings" class="page"><header class="page-header"><div><div class="page-title">设置</div><div class="page-sub">高级网关参数、路由规则、模型映射和本地搜索。</div></div><div class="actions"><button id="saveGatewaySettings" class="btn btn-primary">保存高级参数</button></div></header><div class="page-body"><div class="grid split"><div class="grid">
+      <section id="page-settings" class="page"><header class="page-header"><div><div class="page-title">设置</div><div class="page-sub">Codex 侧默认统一为 gpt-5.5，实际请求自动映射到当前厂商模型。</div></div><div class="actions"><button id="saveGatewaySettings" class="btn btn-primary">保存高级参数</button></div></header><div class="page-body"><div class="grid split"><div class="grid">
         <div class="card"><h3 style="margin:0 0 12px">基础参数</h3><form id="gatewayForm" class="form"><label>监听地址<input class="input" name="listenHost" placeholder="127.0.0.1"></label><label>监听端口<input class="input" name="listenPort" type="number"></label><label>UI 端口<input class="input" name="uiPort" type="number"></label><label>上游 BaseURL<input class="input" name="upstreamBaseUrl" placeholder="https://api.deepseek.com"></label><label class="full">TLS 证书路径（可选）<input class="input" name="tlsCertPath" placeholder="路径或留空"></label><label>连接超时 (ms)<input class="input" name="connectTimeoutMs" type="number"></label><label>读取超时 (ms)<input class="input" name="readTimeoutMs" type="number"></label><label>最大重试次数<input class="input" name="maxRetries" type="number" min="0" max="10"></label><label>重试退避策略<select name="retryBackoff"><option value="exponential">指数退避</option><option value="fixed">固定间隔</option><option value="linear">线性增长</option></select></label><label>Key 调度策略<select name="keyStrategy"><option value="round-robin">轮询 Round Robin</option><option value="least-load">最低负载优先</option><option value="primary-first">固定首选</option></select></label><label>日志级别<select name="logLevel"><option>INFO</option><option>DEBUG</option><option>WARN</option><option>ERROR</option></select></label><label class="full">日志文件路径<input class="input" name="logFilePath"></label><label>每分钟最大请求数<input class="input" name="maxRequestsPerMinute" type="number"></label><label>并发连接上限<input class="input" name="maxConcurrentConnections" type="number"></label><label class="full" style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="logRequestBody" type="checkbox" style="width:auto">记录请求体（含敏感信息，仅调试时开启）</label></form></div>
         <div class="card"><h3 style="margin:0 0 12px">路由规则</h3><p style="margin:0 0 10px;color:#6b7280;font-size:12px">对应原型里的 Codex 入站路径、转换方式、出站路径。</p><div id="routeRows" class="grid"></div><button id="addRouteRow" class="btn btn-secondary" style="margin-top:10px">添加路由规则</button></div>
-        <div class="card"><h3 style="margin:0 0 12px">模型映射</h3><p style="margin:0 0 10px;color:#6b7280;font-size:12px">请求体中的 model 字段会由 Hub 按当前厂商模型重写；这里保留映射参数用于可视化和后续扩展。</p><div id="modelRows" class="grid"></div><button id="addModelRow" class="btn btn-secondary" style="margin-top:10px">添加模型映射</button></div>
+        <div class="card"><details><summary style="cursor:pointer;font-weight:800;color:#111827">模型映射（高级，可选）</summary><p style="margin:10px 0;color:#6b7280;font-size:12px">默认无需配置：Codex 侧统一使用 gpt-5.5，实际请求会转成当前厂商模型。只有需要特殊规则时再修改这里。</p><div id="modelRows" class="grid"></div><button id="addModelRow" class="btn btn-secondary" style="margin-top:10px">添加映射规则</button></details></div>
       </div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">本地搜索</h3><p style="margin:0 0 12px;color:#6b7280">当提示需要实时信息时，Hub 可本地搜索并注入结果。</p><button id="toggleSearch" class="btn btn-secondary">切换本地搜索</button></div><div class="card"><h3 style="margin:0 0 12px">参数说明</h3><div class="notice">监听地址/端口当前由环境变量和启动常量决定，保存后会进入配置文件；需要下一步接线后才会驱动真实监听端口。超时、限流、Key 调度、路由规则已先作为可配置参数落盘。</div></div></div></div></div></section>
     </main>
   </div>
@@ -1386,7 +1452,9 @@ function html({ desktopMac = false } = {}) {
       <label>ID<input class="input" name="id" placeholder="deepseek"></label>
       <label>显示名<input class="input" name="displayName" placeholder="DeepSeek"></label>
       <label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option><option value="mimo">MiMo</option></select></label>
-      <label>模型<input class="input" name="model" placeholder="deepseek-chat"></label>
+      <label>厂商模型（自动映射）<input class="input" name="model" placeholder="deepseek-chat / qwen-max / glm-4.5"></label>
+      <div class="notice full">普通用户只需要填这里：Codex 侧统一显示 gpt-5.5，实际请求会自动改成这个厂商模型。</div>
+      <label class="full" style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="supportsMultimodal" type="checkbox" style="width:auto">支持多模态输入（图片 / 文件 / 音频）</label>
       <label class="full">Base URL<input class="input" name="baseUrl" placeholder="https://api.deepseek.com/v1"></label>
       <label class="full">API Key<div class="key-field"><input class="input" name="apiKey" type="password" placeholder="留空则沿用已保存密钥"><button id="toggleApiKeyVisibility" class="btn btn-secondary" type="button">显示</button></div></label>
       <div class="modal-actions full"><button id="cancelProviderModal" class="btn btn-secondary" type="button">取消</button><button class="btn btn-primary" id="saveProvider">保存厂商</button></div>
@@ -1403,13 +1471,13 @@ async function api(path, opts={}){ const headers={authorization:'Bearer '+AUTH_T
 function nav(page){ document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.nav button[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('page-'+page).classList.add('active'); if(page==='logs') loadLogs(); }
 document.querySelectorAll('.nav button[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));
 function notice(text){ const el=document.createElement('div'); el.className='notice'; el.textContent=text; return el; }
-function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(compact?' compact':'')+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const active=p.id===lastStatus.activeProvider; const usage=(lastStatus.usageStats?.byProvider||{})[p.id]||{}; const errorRate=usage.requests?((usage.errors||0)/usage.requests*100).toFixed(1):'0.0'; el.innerHTML='<div class="provider-main"><h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+'</div><div class="type url"></div><div class="row"></div></div>'+(compact?'':'<div class="provider-usage"><div><div class="usage-title">Token 用量</div><div class="usage-total"></div></div><div class="usage-grid"><div class="usage-mini"><strong data-k="requests"></strong><span>请求数</span></div><div class="usage-mini"><strong data-k="input"></strong><span>输入 Token</span></div><div class="usage-mini"><strong data-k="output"></strong><span>输出 Token</span></div></div><div style="font-size:12px;color:#6b7280"></div></div>'); el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; if(!compact){ el.querySelector('.usage-total').textContent=fmt(usage.totalTokens||0); el.querySelector('[data-k="requests"]').textContent=fmt(usage.requests||0); el.querySelector('[data-k="input"]').textContent=fmt(usage.inputTokens||0); el.querySelector('[data-k="output"]').textContent=fmt(usage.outputTokens||0); el.querySelector('.provider-usage').lastElementChild.textContent='错误率 '+errorRate+'%'+(usage.estimatedRequests?' · 估算 '+usage.estimatedRequests+' 次':''); } const sw=document.createElement('button'); sw.className=active?'btn btn-success':(p.hasKey?'btn btn-primary':'btn btn-secondary'); sw.textContent=active?'当前使用':(p.hasKey?'切换到此厂商':'缺少密钥'); sw.disabled=active||!p.hasKey; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
+function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(compact?' compact':'')+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const multimodalBadge=p.supportsMultimodal?'<span class="badge badge-blue">multi</span>':''; const active=p.id===lastStatus.activeProvider; const usage=(lastStatus.usageStats?.byProvider||{})[p.id]||{}; const errorRate=usage.requests?((usage.errors||0)/usage.requests*100).toFixed(1):'0.0'; el.innerHTML='<div class="provider-main"><h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+multimodalBadge+'</div><div class="type url"></div><div class="row"></div></div>'+(compact?'':'<div class="provider-usage"><div><div class="usage-title">Token 用量</div><div class="usage-total"></div></div><div class="usage-grid"><div class="usage-mini"><strong data-k="requests"></strong><span>请求数</span></div><div class="usage-mini"><strong data-k="input"></strong><span>输入 Token</span></div><div class="usage-mini"><strong data-k="output"></strong><span>输出 Token</span></div></div><div style="font-size:12px;color:#6b7280"></div></div>'); el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; if(!compact){ el.querySelector('.usage-total').textContent=fmt(usage.totalTokens||0); el.querySelector('[data-k="requests"]').textContent=fmt(usage.requests||0); el.querySelector('[data-k="input"]').textContent=fmt(usage.inputTokens||0); el.querySelector('[data-k="output"]').textContent=fmt(usage.outputTokens||0); el.querySelector('.provider-usage').lastElementChild.textContent='错误率 '+errorRate+'%'+(usage.estimatedRequests?' · 估算 '+usage.estimatedRequests+' 次':''); } const sw=document.createElement('button'); sw.className=active?'btn btn-success':(p.hasKey?'btn btn-primary':'btn btn-secondary'); sw.textContent=active?'当前使用':(p.hasKey?'切换到此厂商':'缺少密钥'); sw.disabled=active||!p.hasKey; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
 async function refresh(){ lastStatus=await api('/api/status'); const providers=lastStatus.providers||[]; const activeProvider=providers.find(p=>p.id===lastStatus.activeProvider); const canUseProvider=!!(activeProvider&&activeProvider.hasKey); const enabled=!!lastStatus.gatewayEnabled; $('sideApi').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('apiUrl').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=enabled?(lastStatus.adapterRunning?'运行中':'按需启动'):'已关闭'; if(!providers.length){ $('activeTitle').textContent='尚未添加厂商'; $('activeSub').textContent='请先在厂商管理中手动添加厂商和 API Key。'; } else if(activeProvider){ $('activeTitle').textContent=activeProvider.displayName||activeProvider.id; $('activeSub').textContent='当前 ID：'+activeProvider.id+(enabled?' · 下一次 Codex 请求会走本地代理':' · 代理关闭时 Codex 使用官方 OpenAI'); } else { $('activeTitle').textContent='尚未选择厂商'; $('activeSub').textContent='请选择一个已保存密钥的厂商后再启动代理。'; } $('gatewaySubtitle').textContent=enabled?'代理已启动：Codex 使用当前厂商。':'代理已关闭：Codex 使用官方 OpenAI。'; $('gatewayModeBadge').className='badge '+(enabled?'badge-success':'badge-danger'); $('gatewayModeBadge').textContent=enabled?'● 代理已启动':'● 代理已关闭'; $('gatewayToggle').className='btn '+(enabled?'btn-danger':'btn-primary'); $('gatewayToggle').textContent=enabled?'关闭代理':'启动代理'; $('gatewayToggle').disabled=!enabled&&!canUseProvider; $('testActive').disabled=!canUseProvider; $('activeBadge').textContent=enabled?'Proxy':(canUseProvider?'Ready':'Manual'); updateUsageStats(lastStatus.usageStats||{}); const missing=providers.filter(p=>!p.hasKey).length; $('keyState').textContent=providers.length?(missing===0?'完整':missing+' 缺失'):'未配置'; $('sideStatus').className='status-pill '+(enabled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=enabled?'代理模式':'官方模式'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; if(!providers.length){ $('providers').append(notice('暂无厂商配置，请使用右侧表单手动添加。')); $('quickProviders').append(notice('暂无可切换厂商。')); } else { providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); } fillGatewaySettings(lastStatus.gateway||{}); }
 function setApiKeyVisible(visible){ const f=$('providerForm'); f.elements.apiKey.type=visible?'text':'password'; $('toggleApiKeyVisibility').textContent=visible?'隐藏':'显示'; }
 function resetProviderForm(){ const f=$('providerForm'); f.reset(); f.elements.id.readOnly=false; setApiKeyVisible(false); f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='添加厂商'; $('saveProvider').textContent='保存厂商'; }
 function openProviderModal(){ enhanceSelects($('providerForm')); $('providerModal').hidden=false; setTimeout(()=>$('providerForm').elements.id.focus(),0); }
 function closeProviderModal(){ $('providerModal').hidden=true; closeCustomSelects(); }
-async function fillProviderForm(p){ const f=$('providerForm'); resetProviderForm(); f.elements.id.value=p.id||''; f.elements.id.readOnly=true; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='编辑厂商'; $('saveProvider').textContent='保存修改'; openProviderModal(); try{ const key=await api('/api/provider-key?id='+encodeURIComponent(p.id)); f.elements.apiKey.value=key.apiKey||''; }catch(e){ f.elements.apiKey.value=''; toast(e.message); } }
+async function fillProviderForm(p){ const f=$('providerForm'); resetProviderForm(); f.elements.id.value=p.id||''; f.elements.id.readOnly=true; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.elements.supportsMultimodal.checked=p.supportsMultimodal===true; f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='编辑厂商'; $('saveProvider').textContent='保存修改'; openProviderModal(); try{ const key=await api('/api/provider-key?id='+encodeURIComponent(p.id)); f.elements.apiKey.value=key.apiKey||''; }catch(e){ f.elements.apiKey.value=''; toast(e.message); } }
 async function loadLogs(){ try{ const r=await api('/api/logs?limit=160'); $('logs').innerHTML=(r.lines.length?r.lines:['暂无日志']).map(line=>'<div></div>').join(''); [...$('logs').children].forEach((el,i)=>el.textContent=r.lines[i]||'暂无日志'); }catch(e){ $('logs').textContent=e.message; } }
 function closeCustomSelects(except){ document.querySelectorAll('.custom-select.open').forEach(el=>{ if(el!==except) el.classList.remove('open'); }); }
 function syncCustomSelect(select){ const wrap=select._customSelect; if(!wrap) return; const selected=select.options[select.selectedIndex]; wrap.querySelector('.custom-select-value').textContent=selected?.textContent||''; wrap.querySelectorAll('.custom-select-option').forEach((option)=>option.classList.toggle('selected', option.dataset.value===select.value)); }
@@ -1417,7 +1485,7 @@ function enhanceSelect(select){ if(select._customSelect) { syncCustomSelect(sele
 function enhanceSelects(root=document){ root.querySelectorAll('select').forEach(enhanceSelect); }
 document.addEventListener('click',()=>closeCustomSelects());
 function routeRow(route={}){ const el=document.createElement('div'); el.className='form'; el.innerHTML='<label>入站路径<input class="input" name="inbound" placeholder="POST /v1/responses"></label><label>转换方式<select name="mode"><option value="protocol-convert">协议转换</option><option value="passthrough">透传</option><option value="virtual-response">虚拟响应</option></select></label><label class="full">出站路径<input class="input" name="outbound" placeholder="POST /v1/responses"></label><label style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="enabled" type="checkbox" style="width:auto">启用</label><button type="button" class="btn btn-danger">删除</button>'; el.elements=Object.fromEntries([...el.querySelectorAll('[name]')].map(x=>[x.name,x])); el.elements.inbound.value=route.inbound||''; el.elements.mode.value=route.mode||'protocol-convert'; el.elements.outbound.value=route.outbound||''; el.elements.enabled.checked=route.enabled!==false; el.querySelector('button').onclick=()=>el.remove(); enhanceSelects(el); return el; }
-function modelRow(mapping={}){ const el=document.createElement('div'); el.className='form'; el.innerHTML='<label>Codex 模型名称<input class="input" name="input" placeholder="current"></label><label>输出模型名称<input class="input" name="output" placeholder="provider.model"></label><label style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="enabled" type="checkbox" style="width:auto">启用</label><button type="button" class="btn btn-danger">删除</button>'; el.elements=Object.fromEntries([...el.querySelectorAll('[name]')].map(x=>[x.name,x])); el.elements.input.value=mapping.input||''; el.elements.output.value=mapping.output||''; el.elements.enabled.checked=mapping.enabled!==false; el.querySelector('button').onclick=()=>el.remove(); return el; }
+function modelRow(mapping={}){ const el=document.createElement('div'); el.className='form'; el.innerHTML='<label>Codex 模型名称<input class="input" name="input" placeholder="gpt-5.5"></label><label>输出模型名称<input class="input" name="output" placeholder="provider.model"></label><label style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="enabled" type="checkbox" style="width:auto">启用</label><button type="button" class="btn btn-danger">删除</button>'; el.elements=Object.fromEntries([...el.querySelectorAll('[name]')].map(x=>[x.name,x])); el.elements.input.value=mapping.input||''; el.elements.output.value=mapping.output||''; el.elements.enabled.checked=mapping.enabled!==false; el.querySelector('button').onclick=()=>el.remove(); return el; }
 function fillGatewaySettings(g={}){ const f=$('gatewayForm'); if(!f) return; enhanceSelects(f); for(const [k,v] of Object.entries(g)){ if(!f.elements[k]) continue; if(f.elements[k].type==='checkbox') f.elements[k].checked=!!v; else f.elements[k].value=v; } f.querySelectorAll('select').forEach(syncCustomSelect); $('routeRows').innerHTML=''; (g.routes||[]).forEach(r=>$('routeRows').append(routeRow(r))); $('modelRows').innerHTML=''; (g.modelMappings||[]).forEach(m=>$('modelRows').append(modelRow(m))); }
 function collectGatewaySettings(){ const f=$('gatewayForm'); const data=Object.fromEntries(new FormData(f).entries()); ['listenPort','uiPort','connectTimeoutMs','readTimeoutMs','maxRetries','maxRequestsPerMinute','maxConcurrentConnections'].forEach(k=>data[k]=Number(data[k])); data.logRequestBody=!!f.elements.logRequestBody.checked; data.routes=[...$('routeRows').children].map(row=>({inbound:row.elements.inbound.value,mode:row.elements.mode.value,outbound:row.elements.outbound.value,enabled:row.elements.enabled.checked})); data.modelMappings=[...$('modelRows').children].map(row=>({input:row.elements.input.value,output:row.elements.output.value,enabled:row.elements.enabled.checked})); return data; }
 function fmt(n){ n=Number(n)||0; if(n>=1000000) return (n/1000000).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(1)+'K'; return String(n); }
