@@ -130,6 +130,11 @@ async function ensureHub() {
 }
 
 function createWindow() {
+  const macWindowChrome = process.platform === "darwin" ? {
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 16, y: 16 }
+  } : {};
+
   mainWindow = new BrowserWindow({
     width: 1240,
     height: 820,
@@ -137,7 +142,8 @@ function createWindow() {
     minHeight: 680,
     title: "Codex Switcher",
     icon: existingIcon("icon.png"),
-    backgroundColor: "#6e6e6e",
+    backgroundColor: "#f3f4f6",
+    ...macWindowChrome,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -145,7 +151,7 @@ function createWindow() {
     }
   });
 
-  mainWindow.loadURL(`http://${API_HOST}:${UI_PORT}/?desktop=1`);
+  mainWindow.loadURL(`http://${API_HOST}:${UI_PORT}/?desktop=1&platform=${encodeURIComponent(process.platform)}`);
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: "deny" };
