@@ -11,6 +11,7 @@ const crypto = require("crypto");
 const { pathToFileURL } = require("url");
 
 const ROOT = __dirname;
+const APP_ID = "cc.codex-switcher.app";
 const API_HOST = "127.0.0.1";
 const API_PORT = Number(process.env.CODEX_PROVIDER_HUB_API_PORT || 8789);
 const UI_PORT = Number(process.env.CODEX_PROVIDER_HUB_UI_PORT || 8790);
@@ -196,11 +197,9 @@ function migrateOldKeys() {
 }
 
 function defaultConfig() {
-  const oldEnv = readEnvFile(OLD_MIMO_ENV);
   return {
-    activeProvider: "mimo",
-    codexInstalled: false,
-    gatewayEnabled: true,
+    activeProvider: "",
+    gatewayEnabled: false,
     localSearch: {
       enabled: true,
       provider: "duckduckgo",
@@ -231,26 +230,7 @@ function defaultConfig() {
         { input: "provider id", output: "provider.model", enabled: true }
       ]
     },
-    providers: [
-      {
-        id: "mimo",
-        type: "mimo",
-        displayName: "MiMo v2.5 Pro",
-        model: "mimo-v2.5-pro",
-        baseUrl: oldEnv.MIMO_BASE_URL || "https://api.xiaomimimo.com/v1",
-        keyId: "mimo",
-        contextWindow: 1000000,
-        maxOutputTokens: 131072
-      },
-      {
-        id: "fusecode",
-        type: "responses",
-        displayName: "FuseCode",
-        model: "gpt-5.5",
-        baseUrl: "https://www.fusecode.cc",
-        keyId: "fusecode"
-      }
-    ]
+    providers: []
   };
 }
 
@@ -298,16 +278,69 @@ function normalizeGatewaySettings(settings = {}) {
   };
 }
 
+function isLegacySeededProvider(provider) {
+  if (!provider || typeof provider !== "object") return false;
+  if (provider.id === "mimo") {
+    return provider.type === "mimo" &&
+      provider.displayName === "MiMo v2.5 Pro" &&
+      provider.model === "mimo-v2.5-pro" &&
+      (provider.keyId || "mimo") === "mimo";
+  }
+  if (provider.id === "fusecode") {
+    return provider.type === "responses" &&
+      provider.displayName === "FuseCode" &&
+      provider.model === "gpt-5.5" &&
+      provider.baseUrl === "https://www.fusecode.cc" &&
+      (provider.keyId || "fusecode") === "fusecode";
+  }
+  return false;
+}
+
+function normalizeConfig(config) {
+  let changed = false;
+  const hasLegacyState = Object.prototype.hasOwnProperty.call(config, "codexInstalled") ||
+    Object.prototype.hasOwnProperty.call(config, "officialCodexConfig");
+  if (Object.prototype.hasOwnProperty.call(config, "codexInstalled")) {
+    delete config.codexInstalled;
+    changed = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(config, "officialCodexConfig")) {
+    delete config.officialCodexConfig;
+    changed = true;
+  }
+  if (typeof config.gatewayEnabled !== "boolean") {
+    config.gatewayEnabled = false;
+    changed = true;
+  }
+  if (!Array.isArray(config.providers)) {
+    config.providers = [];
+    changed = true;
+  }
+  if (hasLegacyState) {
+    const providers = config.providers.filter((provider) => !isLegacySeededProvider(provider));
+    if (providers.length !== config.providers.length) {
+      config.providers = providers;
+      changed = true;
+    }
+  }
+  if (!config.activeProvider || !providerById(config, config.activeProvider)) {
+    config.activeProvider = config.providers[0]?.id || "";
+    changed = true;
+  }
+  if (config.gatewayEnabled && !providerById(config)) {
+    config.gatewayEnabled = false;
+    changed = true;
+  }
+  return changed;
+}
+
 function loadConfig() {
   ensureDir(DATA_DIR);
   if (!fs.existsSync(CONFIG_PATH)) writeJson(CONFIG_PATH, defaultConfig());
   migrateOldKeys();
   const config = readJson(CONFIG_PATH, defaultConfig());
   config.gateway = normalizeGatewaySettings(config.gateway);
-  const oldEnv = readEnvFile(OLD_MIMO_ENV);
-  const mimo = providerById(config, "mimo");
-  if (mimo && oldEnv.MIMO_BASE_URL && mimo.baseUrl === "https://api.xiaomimimo.com/v1" && oldEnv.MIMO_API_KEY?.startsWith("tp-")) {
-    mimo.baseUrl = oldEnv.MIMO_BASE_URL;
+  if (normalizeConfig(config)) {
     saveConfig(config);
   }
   syncCodexAuthToken(config);
@@ -329,14 +362,15 @@ function writeCodexAuthToken(token) {
 }
 
 function syncCodexAuthToken(config) {
-  if (!config.codexInstalled) return;
+  if (config.gatewayEnabled !== true) return;
   const token = localAuthToken();
   const auth = readJson(CODEX_AUTH_PATH, {});
   if (auth.OPENAI_API_KEY !== token) writeCodexAuthToken(token);
 }
 
 function providerById(config, id = config.activeProvider) {
-  return config.providers.find((provider) => provider.id === id);
+  const providers = Array.isArray(config.providers) ? config.providers : [];
+  return providers.find((provider) => provider.id === id);
 }
 
 function providerKey(provider) {
@@ -901,11 +935,22 @@ async function prepareProviderForSwitch(provider) {
   if (provider.type !== "responses") await ensureAdapter(provider);
 }
 
+function requireConfiguredProvider(config = loadConfig()) {
+  const provider = providerById(config);
+  if (!provider) {
+    throw new Error("还没有配置当前厂商，请先在厂商管理中手动添加厂商。");
+  }
+  if (!providerKey(provider)) {
+    throw new Error(`Provider ${provider.displayName || provider.id} has no API key.`);
+  }
+  return provider;
+}
+
 async function handleResponses(req, res) {
   const config = loadConfig();
   const provider = providerById(config);
   if (!provider) {
-    sendJson(res, 500, { error: { type: "provider_hub_error", message: `Active provider not found: ${config.activeProvider}` } });
+    sendJson(res, 400, { error: { type: "provider_hub_error", message: "还没有配置当前厂商，请先在 Codex Switcher 中手动添加厂商。" } });
     return;
   }
   const raw = await readRequestBody(req);
@@ -932,9 +977,14 @@ async function handleResponses(req, res) {
   }, { provider, model: payload.model, requestPayload: payload });
 }
 
-function installCodexConfig() {
+function enableProxyMode() {
+  const config = loadConfig();
+  requireConfiguredProvider(config);
   ensureDir(CODEX_DIR);
   const existing = fs.existsSync(CODEX_CONFIG_PATH) ? readText(CODEX_CONFIG_PATH) : "";
+  if (config.gatewayEnabled !== true && !usesProviderHubConfig(existing)) {
+    config.codexConfigBeforeProxy = existing;
+  }
   const providerBlock = `[model_providers.provider-hub]
 name = "Codex Provider Hub"
 base_url = "http://127.0.0.1:${API_PORT}/v1"
@@ -949,57 +999,55 @@ request_max_retries = 3`;
   fs.writeFileSync(CODEX_CONFIG_PATH, next);
   chmodPrivate(CODEX_CONFIG_PATH);
   writeCodexAuthToken(localAuthToken());
-  const config = loadConfig();
-  config.codexInstalled = true;
   config.gatewayEnabled = true;
   saveConfig(config);
 }
 
-function ensureCodexConfigInstalled() {
+function ensureProxyMode() {
   const config = loadConfig();
-  if (config.gatewayEnabled === false) {
-    appendLog("codex config ensure skipped", { reason: "gateway disabled" });
+  if (config.gatewayEnabled !== true) {
+    appendLog("proxy mode ensure skipped", { reason: "proxy disabled" });
     return;
   }
   try {
-    installCodexConfig();
-    appendLog("codex config ensured", { path: CODEX_CONFIG_PATH });
+    enableProxyMode();
+    appendLog("proxy mode ensured", { path: CODEX_CONFIG_PATH });
   } catch (error) {
-    appendLog("codex config ensure failed", { message: error.message });
+    appendLog("proxy mode ensure failed", { message: error.message });
   }
 }
 
-function restoreOpenAIConfig() {
+function disableProxyMode() {
   ensureDir(CODEX_DIR);
   const existing = fs.existsSync(CODEX_CONFIG_PATH) ? readText(CODEX_CONFIG_PATH) : "";
-  
-  // Backup current config
+  const config = loadConfig();
+
   const backupPath = path.join(DATA_DIR, `config-backup-${Date.now()}.toml`);
   ensureDir(DATA_DIR);
   fs.writeFileSync(backupPath, existing);
   appendLog("config backed up", { path: backupPath });
-  
-  // Remove provider-hub section
-  const escaped = "model_providers.provider-hub".replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const sectionRe = new RegExp(`(^|\\n)\[${escaped}\]\\n[\\s\\S]*?(?=\\n\[|$)`);
-  let cleaned = existing.replace(sectionRe, "$1").replace(/\n{3,}/g, "\n\n").replace(/\s+$/u, "") + "\n";
-  
-  // Restore official OpenAI settings
-  const next = setTopLevel(cleaned, {
-    model_provider: "\"openai\"",
-    model: "\"o3\"",
-    model_reasoning_effort: "\"high\""
-  }, []);
+
+  let next;
+  if (typeof config.codexConfigBeforeProxy === "string") {
+    next = config.codexConfigBeforeProxy.replace(/\s+$/u, "") + "\n";
+  } else {
+    const escaped = "model_providers.provider-hub".replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const sectionRe = new RegExp(`(^|\\n)\\[${escaped}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`);
+    const cleaned = existing.replace(sectionRe, "$1").replace(/\n{3,}/g, "\n\n").replace(/\s+$/u, "") + "\n";
+    next = setTopLevel(cleaned, {
+      model_provider: "\"openai\"",
+      model: "\"o3\"",
+      model_reasoning_effort: "\"high\""
+    }, []);
+  }
   
   fs.writeFileSync(CODEX_CONFIG_PATH, next);
   chmodPrivate(CODEX_CONFIG_PATH);
-  
-  // Update hub config
-  const config = loadConfig();
-  config.codexInstalled = false;
+
   config.gatewayEnabled = false;
+  delete config.codexConfigBeforeProxy;
   saveConfig(config);
-  
+
   return backupPath;
 }
 
@@ -1029,6 +1077,10 @@ function upsertSection(text, sectionName, block) {
   return text.replace(/\s+$/u, "") + "\n\n" + block + "\n";
 }
 
+function usesProviderHubConfig(text) {
+  return /^\s*model_provider\s*=\s*["']provider-hub["']/m.test(text || "");
+}
+
 function securityHeaders(extra = {}) {
   return {
     "cache-control": "no-store",
@@ -1047,13 +1099,13 @@ async function statusPayload() {
   const config = loadConfig();
   const provider = providerById(config);
   return {
+    appId: APP_ID,
     apiUrl: `http://${API_HOST}:${API_PORT}/v1`,
     uiUrl: `http://${API_HOST}:${UI_PORT}`,
     dataDir: DATA_DIR,
     activeProvider: config.activeProvider,
     activeProviderDisplayName: provider?.displayName || config.activeProvider,
-    gatewayEnabled: config.gatewayEnabled !== false && !!config.codexInstalled,
-    codexInstalled: !!config.codexInstalled,
+    gatewayEnabled: config.gatewayEnabled === true,
     adapterRunning: !!(adapter?.process && !adapter.process.killed) && await canConnect(ADAPTER_PORT),
     providers: config.providers.map(redactedProvider),
     localSearch: config.localSearch,
@@ -1124,20 +1176,20 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, gateway: config.gateway, message: "高级参数已保存。部分监听端口类参数需要重启 Hub 后生效。" });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/install-codex") {
-    installCodexConfig();
-    sendJson(res, 200, { ok: true, message: "网关已开启：Codex 将使用当前选择的厂商。" });
-    return;
-  }
   if (req.method === "POST" && req.url === "/api/gateway-toggle") {
     const body = await readJsonBody(req);
     if (body.enabled === false) {
-      const backupPath = restoreOpenAIConfig();
-      sendJson(res, 200, { ok: true, enabled: false, message: "网关已关闭：Codex 已恢复官方 OpenAI 配置。", backupPath });
+      const backupPath = disableProxyMode();
+      sendJson(res, 200, { ok: true, enabled: false, message: "代理已关闭：Codex 已恢复官方 OpenAI 配置。", backupPath });
       return;
     }
-    installCodexConfig();
-    sendJson(res, 200, { ok: true, enabled: true, message: "网关已开启：Codex 将使用当前选择的厂商。" });
+    try {
+      enableProxyMode();
+    } catch (error) {
+      sendJson(res, 400, { ok: false, message: error.message });
+      return;
+    }
+    sendJson(res, 200, { ok: true, enabled: true, message: "代理已启动：Codex 将通过本地代理使用当前厂商。" });
     return;
   }
   if (req.method === "POST" && req.url === "/api/switch") {
@@ -1163,6 +1215,18 @@ async function handleApi(req, res) {
       throw error;
     }
     sendJson(res, 200, { ok: true, message: `Switched to ${provider.id}. Next Codex request will use ${provider.displayName || provider.id}.` });
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/provider-key")) {
+    const url = new URL(req.url, `http://${API_HOST}:${UI_PORT}`);
+    const id = String(url.searchParams.get("id") || "").trim();
+    const config = loadConfig();
+    const provider = providerById(config, id);
+    if (!provider) {
+      sendJson(res, 404, { ok: false, message: `Provider not found: ${id}` });
+      return;
+    }
+    sendJson(res, 200, { ok: true, id, apiKey: providerKey(provider) });
     return;
   }
   if (req.method === "POST" && req.url === "/api/providers") {
@@ -1197,8 +1261,10 @@ async function handleApi(req, res) {
       sendJson(res, 400, { ok: false, message: baseUrlValidation.message });
       return;
     }
+    const shouldActivate = !config.activeProvider || !providerById(config, config.activeProvider);
     config.providers = config.providers.filter((item) => item.id !== provider.id);
     config.providers.push(provider);
+    if (shouldActivate) config.activeProvider = provider.id;
     saveConfig(config);
     if (body.apiKey) {
       const keys = loadKeys();
@@ -1221,6 +1287,12 @@ async function handleApi(req, res) {
     return;
   }
   if (req.method === "POST" && req.url === "/api/test-active") {
+    try {
+      requireConfiguredProvider(loadConfig());
+    } catch (error) {
+      sendJson(res, 400, { ok: false, message: error.message });
+      return;
+    }
     const started = Date.now();
     const response = await fetch(`http://${API_HOST}:${API_PORT}/v1/responses`, {
       method: "POST",
@@ -1246,11 +1318,6 @@ async function handleApi(req, res) {
     });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/uninstall-codex") {
-    const backupPath = restoreOpenAIConfig();
-    sendJson(res, 200, { ok: true, message: "网关已关闭：Codex 已恢复官方 OpenAI 配置。", backupPath });
-    return;
-  }
   sendJson(res, 404, { ok: false, message: "Not found" });
 }
 
@@ -1262,7 +1329,19 @@ function html() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Codex Switcher</title>
 <style>
-*,*::before,*::after{box-sizing:border-box}body{margin:0;min-height:100vh;font:13px/1.45 "Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:#1f2328;background:#6e6e6e;display:grid;place-items:center;padding:18px}button,input,select{font:inherit;max-width:100%}.window{width:min(1240px,calc(100vw - 24px));height:min(780px,calc(100vh - 24px));background:#f3f4f6;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.34),0 0 0 1px rgba(0,0,0,.14);display:flex;flex-direction:column}.titlebar{height:34px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 16px;user-select:none}.title-left{display:flex;align-items:center;gap:9px;color:#6b7280;font-size:12px}.app-icon{width:16px;height:16px;border-radius:4px;background:#2563eb;display:grid;place-items:center;color:white;font-weight:800;font-size:11px}.traffic{display:flex}.traffic button{width:42px;height:32px;border:0;background:transparent;color:#6b7280}.traffic button:hover{background:#f3f4f6}.traffic .close:hover{background:#dc2626;color:white}.shell{flex:1;min-height:0;display:flex}.sidebar{width:230px;background:#fff;border-right:1px solid #e5e7eb;display:flex;flex-direction:column}.brand{padding:18px 16px 10px}.brand h1{font-size:16px;line-height:1.1;margin:0;color:#111827;letter-spacing:-.02em}.brand p{margin:3px 0 0;color:#6b7280;font-size:11px}.status-pill{margin-top:12px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:700}.status-pill.ok{background:#ecfdf5;color:#15803d}.status-pill.warn{background:#fff7ed;color:#c2410c}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}.nav-label{padding:14px 16px 5px;color:#8b949e;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.07em}.nav{padding:0 8px}.nav button{width:100%;height:36px;border:0;border-radius:7px;background:transparent;color:#6b7280;display:flex;align-items:center;gap:10px;padding:0 10px;text-align:left;cursor:pointer}.nav button:hover{background:#f3f4f6;color:#111827}.nav button.active{background:#eaf1ff;color:#2563eb;font-weight:700}.sidebar-footer{margin-top:auto;padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:11px}.content{flex:1;min-width:0;display:flex;flex-direction:column}.page{display:none;min-height:0;flex:1;flex-direction:column}.page.active{display:flex}.page-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:20px 24px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.page-title{font-size:19px;font-weight:800;letter-spacing:-.025em;color:#111827}.page-sub{margin-top:3px;color:#6b7280;font-size:12px}.page-body{padding:20px 24px;overflow:auto;overflow-x:hidden}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:7px;min-height:34px;padding:0 13px;display:inline-flex;align-items:center;gap:7px;font-weight:750;cursor:pointer}.btn-primary{background:#2563eb;color:white}.btn-primary:hover{background:#1d4ed8}.btn-secondary{background:#fff;color:#111827;border:1px solid #d1d5db}.btn-secondary:hover{background:#f9fafb}.btn-danger{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.btn-success{background:#ecfdf5;color:#15803d;border:1px solid #bbf7d0}.btn:disabled{opacity:.55;cursor:not-allowed}.grid{display:grid;gap:14px}.stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px;min-width:0;overflow:hidden}.stat-label{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.stat-value{font-size:26px;font-weight:850;letter-spacing:-.03em;margin-top:4px;color:#111827}.stat-note{font-size:11px;color:#6b7280;margin-top:4px}.hero{display:flex;justify-content:space-between;gap:24px;align-items:center;background:linear-gradient(135deg,#fff,#f8fbff);border:1px solid #dbeafe;border-radius:12px;padding:18px 20px;margin-bottom:18px}.hero h2{font-size:17px;margin:0;color:#111827}.hero p{margin:4px 0 0;color:#6b7280}.meta{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}.meta div{font-size:12px;color:#6b7280}.meta code,.code{font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:11px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;padding:2px 6px;color:#111827}.providers{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.provider{position:relative;background:#fff;border:1px solid #e5e7eb;border-radius:11px;padding:15px;transition:.14s}.provider:not(.compact){display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,320px);gap:16px;align-items:stretch}.provider-main{min-width:0}.provider-usage{border-left:1px solid #e5e7eb;padding-left:16px;display:grid;align-content:center;gap:10px}.usage-title{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.usage-total{font-size:24px;font-weight:850;color:#111827;letter-spacing:-.03em}.usage-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.usage-mini{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px}.usage-mini strong{display:block;font-size:13px;color:#111827}.usage-mini span{font-size:10px;color:#6b7280}.provider:hover{border-color:#bfdbfe;box-shadow:0 8px 24px rgba(37,99,235,.08)}.provider.active{border-color:#60a5fa;background:#f8fbff}.provider h3{margin:0;font-size:15px;color:#111827}.provider .type{margin-top:7px;color:#6b7280;font-size:12px;display:flex;gap:6px;flex-wrap:wrap}.provider .row{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:750}.badge-ok{background:#ecfdf5;color:#15803d}.badge-warn{background:#fff7ed;color:#c2410c}.badge-blue{background:#eaf1ff;color:#2563eb}.badge-muted{background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb}.badge-danger{background:#fef2f2;color:#dc2626}.badge-success{background:#ecfdf5;color:#15803d}.split{grid-template-columns:minmax(0,1fr) minmax(320px,360px);align-items:start}.form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;min-width:0}.form label{display:grid;gap:5px;color:#6b7280;font-size:12px;min-width:0}.form .full{grid-column:1/-1}.input,select{width:100%;min-width:0;height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 10px}.input:focus,select:focus{outline:2px solid #bfdbfe;border-color:#60a5fa}select.native-select{position:absolute!important;opacity:0!important;pointer-events:none!important;width:1px!important;height:1px!important}.custom-select{position:relative;min-width:0}.custom-select-trigger{width:100%;height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 34px 0 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;text-align:left}.custom-select-trigger:hover{background:#f9fafb}.custom-select.open .custom-select-trigger{border-color:#60a5fa;outline:2px solid #bfdbfe}.custom-select-trigger::after{content:"";position:absolute;right:12px;top:50%;width:8px;height:8px;border-right:1.8px solid #6b7280;border-bottom:1.8px solid #6b7280;transform:translateY(-65%) rotate(45deg);transition:.14s}.custom-select.open .custom-select-trigger::after{transform:translateY(-35%) rotate(225deg)}.custom-select-menu{position:absolute;z-index:30;left:0;right:0;top:calc(100% + 6px);background:#fff;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 14px 36px rgba(15,23,42,.16);padding:5px;display:none;max-height:220px;overflow:auto}.custom-select.open .custom-select-menu{display:block}.custom-select-option{height:32px;border-radius:6px;padding:0 9px;display:flex;align-items:center;cursor:pointer;color:#374151}.custom-select-option:hover{background:#f3f4f6;color:#111827}.custom-select-option.selected{background:#eaf1ff;color:#2563eb;font-weight:750}.logbox{height:430px;overflow:auto;background:#0b1220;color:#dbeafe;border-radius:10px;border:1px solid #111827;padding:13px;font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:12px;line-height:1.6}.logbox div{white-space:pre-wrap;border-bottom:1px solid rgba(255,255,255,.06);padding:3px 0}.notice{border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;border-radius:9px;padding:12px;font-size:12px;overflow-wrap:anywhere;word-break:break-word;max-height:180px;overflow:auto}.chart{height:220px;border:1px solid #e5e7eb;border-radius:10px;background:linear-gradient(180deg,#fff,#f8fafc);padding:14px;overflow:hidden}.trend-svg{width:100%;height:100%;display:block}.trend-grid{stroke:#e5e7eb;stroke-width:1}.trend-area{fill:url(#tokenGradient);opacity:.18}.trend-line{fill:none;stroke:#2563eb;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.trend-dot{fill:#fff;stroke:#2563eb;stroke-width:3}.trend-label{fill:#6b7280;font-size:11px;text-anchor:middle}.trend-value{fill:#111827;font-size:11px;font-weight:700;text-anchor:middle}.hbar-row{display:grid;grid-template-columns:minmax(90px,1fr) 2fr auto;gap:10px;align-items:center}.hbar-track{height:9px;border-radius:999px;background:#e5e7eb;overflow:hidden}.hbar-fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,#2563eb,#60a5fa)}.toast{position:fixed;right:28px;bottom:28px;max-width:460px;background:#111827;color:#fff;border-radius:10px;padding:12px 14px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:none;z-index:10}.toast.show{display:block}@media(max-width:1100px){body{padding:0}.window{width:100vw;height:100vh;border-radius:0}.sidebar{width:200px}.stats,.split{grid-template-columns:1fr}.provider:not(.compact){grid-template-columns:1fr}.provider-usage{border-left:0;border-top:1px solid #e5e7eb;padding-left:0;padding-top:14px}.form{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.page-header{flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.shell{flex-direction:column}.sidebar{width:100%;border-right:0;border-bottom:1px solid #e5e7eb;max-height:190px}.brand{padding:12px 14px 6px}.nav-label{display:none}.nav{display:flex;gap:6px;overflow:auto;padding:6px 8px}.nav button{min-width:max-content;width:auto}.sidebar-footer{display:none}.page-header{padding:14px 16px}.page-body{padding:14px 16px}.stats{grid-template-columns:1fr}.providers{grid-template-columns:1fr}.traffic{display:none}}
+*,*::before,*::after{box-sizing:border-box}body{margin:0;min-height:100vh;font:13px/1.45 "Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:#1f2328;background:#6e6e6e;display:grid;place-items:center;padding:18px}button,input,select{font:inherit;max-width:100%}.window{width:min(1240px,calc(100vw - 24px));height:min(780px,calc(100vh - 24px));background:#f3f4f6;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.34),0 0 0 1px rgba(0,0,0,.14);display:flex;flex-direction:column}.titlebar{height:34px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 16px;user-select:none}.title-left{display:flex;align-items:center;gap:9px;color:#6b7280;font-size:12px}.app-icon{width:16px;height:16px;border-radius:4px;background:#2563eb;display:grid;place-items:center;color:white;font-weight:800;font-size:11px}.traffic{display:flex}.traffic button{width:42px;height:32px;border:0;background:transparent;color:#6b7280}.traffic button:hover{background:#f3f4f6}.traffic .close:hover{background:#dc2626;color:white}.shell{flex:1;min-height:0;display:flex}.sidebar{width:230px;background:#fff;border-right:1px solid #e5e7eb;display:flex;flex-direction:column}.brand{padding:18px 16px 10px}.brand h1{font-size:16px;line-height:1.1;margin:0;color:#111827;letter-spacing:-.02em}.brand p{margin:3px 0 0;color:#6b7280;font-size:11px}.status-pill{margin-top:12px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:700}.status-pill.ok{background:#ecfdf5;color:#15803d}.status-pill.warn{background:#fff7ed;color:#c2410c}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}.nav-label{padding:14px 16px 5px;color:#8b949e;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.07em}.nav{padding:0 8px}.nav button{width:100%;height:36px;border:0;border-radius:7px;background:transparent;color:#6b7280;display:flex;align-items:center;gap:10px;padding:0 10px;text-align:left;cursor:pointer}.nav button:hover{background:#f3f4f6;color:#111827}.nav button.active{background:#eaf1ff;color:#2563eb;font-weight:700}.sidebar-footer{margin-top:auto;padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:11px}.content{flex:1;min-width:0;display:flex;flex-direction:column}.page{display:none;min-height:0;flex:1;flex-direction:column}.page.active{display:flex}.page-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:20px 24px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.page-title{font-size:19px;font-weight:800;letter-spacing:-.025em;color:#111827}.page-sub{margin-top:3px;color:#6b7280;font-size:12px}.page-body{padding:20px 24px;overflow:auto;overflow-x:hidden}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:7px;min-height:34px;padding:0 13px;display:inline-flex;align-items:center;gap:7px;font-weight:750;cursor:pointer}.btn-primary{background:#2563eb;color:white}.btn-primary:hover{background:#1d4ed8}.btn-secondary{background:#fff;color:#111827;border:1px solid #d1d5db}.btn-secondary:hover{background:#f9fafb}.btn-danger{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.btn-success{background:#ecfdf5;color:#15803d;border:1px solid #bbf7d0}.btn:disabled{opacity:.55;cursor:not-allowed}.grid{display:grid;gap:14px}.stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px;min-width:0;overflow:hidden}.stat-label{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.stat-value{font-size:26px;font-weight:850;letter-spacing:-.03em;margin-top:4px;color:#111827}.stat-note{font-size:11px;color:#6b7280;margin-top:4px}.hero{display:flex;justify-content:space-between;gap:24px;align-items:center;background:linear-gradient(135deg,#fff,#f8fbff);border:1px solid #dbeafe;border-radius:12px;padding:18px 20px;margin-bottom:18px}.hero h2{font-size:17px;margin:0;color:#111827}.hero p{margin:4px 0 0;color:#6b7280}.meta{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}.meta div{font-size:12px;color:#6b7280}.meta code,.code{font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:11px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;padding:2px 6px;color:#111827}.providers{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.provider{position:relative;background:#fff;border:1px solid #e5e7eb;border-radius:11px;padding:15px;transition:.14s}.provider:not(.compact){display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,320px);gap:16px;align-items:stretch}.provider-main{min-width:0}.provider-usage{border-left:1px solid #e5e7eb;padding-left:16px;display:grid;align-content:center;gap:10px}.usage-title{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.usage-total{font-size:24px;font-weight:850;color:#111827;letter-spacing:-.03em}.usage-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.usage-mini{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px}.usage-mini strong{display:block;font-size:13px;color:#111827}.usage-mini span{font-size:10px;color:#6b7280}.provider:hover{border-color:#bfdbfe;box-shadow:0 8px 24px rgba(37,99,235,.08)}.provider.active{border-color:#60a5fa;background:#f8fbff}.provider h3{margin:0;font-size:15px;color:#111827}.provider .type{margin-top:7px;color:#6b7280;font-size:12px;display:flex;gap:6px;flex-wrap:wrap}.provider .row{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:750}.badge-ok{background:#ecfdf5;color:#15803d}.badge-warn{background:#fff7ed;color:#c2410c}.badge-blue{background:#eaf1ff;color:#2563eb}.badge-muted{background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb}.badge-danger{background:#fef2f2;color:#dc2626}.badge-success{background:#ecfdf5;color:#15803d}.split{grid-template-columns:minmax(0,1fr) minmax(320px,360px);align-items:start}.form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;min-width:0}.form label{display:grid;gap:5px;color:#6b7280;font-size:12px;min-width:0}.form .full{grid-column:1/-1}.input,select{width:100%;min-width:0;height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 10px}.input:focus,select:focus{outline:2px solid #bfdbfe;border-color:#60a5fa}.input[readonly]{background:#f9fafb;color:#6b7280}select.native-select{position:absolute!important;opacity:0!important;pointer-events:none!important;width:1px!important;height:1px!important}.custom-select{position:relative;min-width:0}.custom-select-trigger{width:100%;height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 34px 0 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;text-align:left}.custom-select-trigger:hover{background:#f9fafb}.custom-select.open .custom-select-trigger{border-color:#60a5fa;outline:2px solid #bfdbfe}.custom-select-trigger::after{content:"";position:absolute;right:12px;top:50%;width:8px;height:8px;border-right:1.8px solid #6b7280;border-bottom:1.8px solid #6b7280;transform:translateY(-65%) rotate(45deg);transition:.14s}.custom-select.open .custom-select-trigger::after{transform:translateY(-35%) rotate(225deg)}.custom-select-menu{position:absolute;z-index:30;left:0;right:0;top:calc(100% + 6px);background:#fff;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 14px 36px rgba(15,23,42,.16);padding:5px;display:none;max-height:220px;overflow:auto}.custom-select.open .custom-select-menu{display:block}.custom-select-option{height:32px;border-radius:6px;padding:0 9px;display:flex;align-items:center;cursor:pointer;color:#374151}.custom-select-option:hover{background:#f3f4f6;color:#111827}.custom-select-option.selected{background:#eaf1ff;color:#2563eb;font-weight:750}.logbox{height:430px;overflow:auto;background:#0b1220;color:#dbeafe;border-radius:10px;border:1px solid #111827;padding:13px;font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:12px;line-height:1.6}.logbox div{white-space:pre-wrap;border-bottom:1px solid rgba(255,255,255,.06);padding:3px 0}.notice{border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;border-radius:9px;padding:12px;font-size:12px;overflow-wrap:anywhere;word-break:break-word;max-height:180px;overflow:auto}.chart{height:220px;border:1px solid #e5e7eb;border-radius:10px;background:linear-gradient(180deg,#fff,#f8fafc);padding:14px;overflow:hidden}.trend-svg{width:100%;height:100%;display:block}.trend-grid{stroke:#e5e7eb;stroke-width:1}.trend-area{fill:url(#tokenGradient);opacity:.18}.trend-line{fill:none;stroke:#2563eb;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.trend-dot{fill:#fff;stroke:#2563eb;stroke-width:3}.trend-label{fill:#6b7280;font-size:11px;text-anchor:middle}.trend-value{fill:#111827;font-size:11px;font-weight:700;text-anchor:middle}.hbar-row{display:grid;grid-template-columns:minmax(90px,1fr) 2fr auto;gap:10px;align-items:center}.hbar-track{height:9px;border-radius:999px;background:#e5e7eb;overflow:hidden}.hbar-fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,#2563eb,#60a5fa)}.modal-backdrop[hidden]{display:none!important}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.38);display:grid;place-items:center;padding:20px;z-index:20}.modal-panel{width:min(560px,100%);max-height:min(720px,calc(100vh - 40px));overflow:auto;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:16px;box-shadow:0 24px 70px rgba(0,0,0,.34)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}.modal-head h3{margin:0;font-size:16px;color:#111827}.icon-btn{width:34px;height:34px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#6b7280;font-size:18px;line-height:1;cursor:pointer}.icon-btn:hover{background:#f3f4f6;color:#111827}.key-field{display:flex;gap:8px;min-width:0}.key-field .input{flex:1}.key-field .btn{min-width:72px;justify-content:center}.modal-actions{display:flex;justify-content:flex-end;gap:8px}.toast{position:fixed;right:28px;bottom:28px;max-width:460px;background:#111827;color:#fff;border-radius:10px;padding:12px 14px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:none;z-index:30}.toast.show{display:block}@media(max-width:1100px){body{padding:0}.window{width:100vw;height:100vh;border-radius:0}.sidebar{width:200px}.stats,.split{grid-template-columns:1fr}.provider:not(.compact){grid-template-columns:1fr}.provider-usage{border-left:0;border-top:1px solid #e5e7eb;padding-left:0;padding-top:14px}.form{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.page-header{flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.shell{flex-direction:column}.sidebar{width:100%;border-right:0;border-bottom:1px solid #e5e7eb;max-height:190px}.brand{padding:12px 14px 6px}.nav-label{display:none}.nav{display:flex;gap:6px;overflow:auto;padding:6px 8px}.nav button{min-width:max-content;width:auto}.sidebar-footer{display:none}.page-header{padding:14px 16px}.page-body{padding:14px 16px}.stats{grid-template-columns:1fr}.providers{grid-template-columns:1fr}.traffic{display:none}.key-field{flex-direction:column}.key-field .btn{width:100%}}
+#page-providers .providers{grid-template-columns:1fr}
+#page-providers .provider{padding:16px 18px}
+#page-providers .provider:not(.compact){grid-template-columns:minmax(0,1fr) minmax(420px,520px);align-items:center}
+#page-providers .provider-main{display:grid;grid-template-columns:minmax(150px,220px) minmax(0,1fr) auto;grid-template-areas:"title meta actions" "url url actions";gap:8px 14px;align-items:center}
+#page-providers .provider-main h3{grid-area:title;font-size:16px;line-height:1.2;overflow-wrap:anywhere}
+#page-providers .provider-main>.type:not(.url){grid-area:meta;margin-top:0;align-items:center}
+#page-providers .provider-main>.url{grid-area:url;margin-top:0;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#page-providers .provider-main>.row{grid-area:actions;margin-top:0;justify-content:flex-end;flex-wrap:nowrap}
+#page-providers .provider-usage{grid-template-columns:minmax(110px,.65fr) minmax(280px,1.35fr);align-items:center}
+#page-providers .usage-grid{grid-template-columns:repeat(3,minmax(84px,1fr))}
+#page-providers .usage-mini{padding:8px 10px}
+@media(max-width:1100px){#page-providers .provider:not(.compact){grid-template-columns:1fr}#page-providers .provider-main{grid-template-columns:1fr;grid-template-areas:"title" "meta" "url" "actions"}#page-providers .provider-main>.row{justify-content:flex-start;flex-wrap:wrap}#page-providers .provider-usage{grid-template-columns:1fr;border-left:0;border-top:1px solid #e5e7eb;padding-left:0;padding-top:14px}}
 </style>
 </head>
 <body>
@@ -1282,23 +1361,38 @@ function html() {
     </aside>
     <main class="content">
       <section id="page-overview" class="page active">
-        <header class="page-header"><div><div class="page-title">运行概览</div><div class="page-sub" id="gatewaySubtitle">开启时 Codex 使用当前厂商；关闭时恢复官方 OpenAI。</div></div><div class="actions"><span id="gatewayModeBadge" class="badge badge-muted">读取中</span><button id="gatewayToggle" class="btn btn-primary">开启网关</button><button id="testActive" class="btn btn-secondary">测试当前厂商</button></div></header>
+        <header class="page-header"><div><div class="page-title">运行概览</div><div class="page-sub" id="gatewaySubtitle">启动代理时 Codex 使用当前厂商；关闭代理时恢复官方 OpenAI。</div></div><div class="actions"><span id="gatewayModeBadge" class="badge badge-muted">读取中</span><button id="gatewayToggle" class="btn btn-primary">启动代理</button><button id="testActive" class="btn btn-secondary">测试当前厂商</button></div></header>
         <div class="page-body">
           <div class="hero"><div><h2 id="activeTitle">当前厂商</h2><p id="activeSub">读取中...</p><div class="meta"><div>API <code id="apiUrl">-</code></div><div>数据目录 <code id="dataDir">-</code></div><div>Adapter <code id="adapterState">-</code></div></div></div><span id="activeBadge" class="badge badge-blue">Current</span></div>
           <div class="grid stats"><div class="card"><div class="stat-label">总请求</div><div id="requestCount" class="stat-value">-</div><div class="stat-note" id="errorRate">错误率 -</div></div><div class="card"><div class="stat-label">Token 用量</div><div id="tokenTotal" class="stat-value">-</div><div class="stat-note" id="tokenSplit">输入 - / 输出 -</div></div><div class="card"><div class="stat-label">当前模型用量</div><div id="activeModelTokens" class="stat-value">-</div><div class="stat-note" id="activeModelName">-</div></div><div class="card"><div class="stat-label">密钥状态</div><div id="keyState" class="stat-value">-</div><div class="stat-note">缺失时不可切换</div></div></div>
           <div class="grid split"><div class="grid"><div class="card"><h3 style="margin:0 0 12px">Token 用量趋势（近 7 天）</h3><div id="tokenChart" class="chart"></div></div><div class="card"><h3 style="margin:0 0 12px">快速切换</h3><div id="quickProviders" class="grid providers"></div></div></div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">模型用量排行</h3><div id="modelUsage" class="grid"></div></div><div class="card"><h3 style="margin:0 0 12px">操作反馈</h3><div id="messagePanel" class="notice">准备就绪。选择厂商后，下次 Codex 请求会使用新厂商。</div></div></div></div>
         </div>
       </section>
-      <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div class="grid split"><div><div id="providers" class="grid providers"></div></div><div class="card"><h3 id="providerFormTitle" style="margin:0 0 12px">添加自定义厂商</h3><form id="providerForm" class="form"><label>ID<input class="input" name="id" placeholder="deepseek"></label><label>显示名<input class="input" name="displayName" placeholder="DeepSeek"></label><label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option><option value="mimo">MiMo</option></select></label><label>模型<input class="input" name="model" placeholder="deepseek-chat"></label><label class="full">Base URL<input class="input" name="baseUrl" placeholder="https://api.deepseek.com/v1"></label><label class="full">API Key<input class="input" name="apiKey" type="password" placeholder="留空则沿用已保存密钥"></label><button class="btn btn-primary full" id="saveProvider">保存厂商</button></form></div></div></div></section>
+      <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div id="providers" class="grid providers"></div></div></section>
       <section id="page-logs" class="page"><header class="page-header"><div><div class="page-title">运行日志</div><div class="page-sub">读取本地 data/hub.log，便于排查切换和适配器状态。</div></div><div class="actions"><button id="refreshLogs" class="btn btn-secondary">刷新日志</button></div></header><div class="page-body"><div id="logs" class="logbox">读取中...</div></div></section>
       <section id="page-settings" class="page"><header class="page-header"><div><div class="page-title">设置</div><div class="page-sub">高级网关参数、路由规则、模型映射和本地搜索。</div></div><div class="actions"><button id="saveGatewaySettings" class="btn btn-primary">保存高级参数</button></div></header><div class="page-body"><div class="grid split"><div class="grid">
         <div class="card"><h3 style="margin:0 0 12px">基础参数</h3><form id="gatewayForm" class="form"><label>监听地址<input class="input" name="listenHost" placeholder="127.0.0.1"></label><label>监听端口<input class="input" name="listenPort" type="number"></label><label>UI 端口<input class="input" name="uiPort" type="number"></label><label>上游 BaseURL<input class="input" name="upstreamBaseUrl" placeholder="https://api.deepseek.com"></label><label class="full">TLS 证书路径（可选）<input class="input" name="tlsCertPath" placeholder="路径或留空"></label><label>连接超时 (ms)<input class="input" name="connectTimeoutMs" type="number"></label><label>读取超时 (ms)<input class="input" name="readTimeoutMs" type="number"></label><label>最大重试次数<input class="input" name="maxRetries" type="number" min="0" max="10"></label><label>重试退避策略<select name="retryBackoff"><option value="exponential">指数退避</option><option value="fixed">固定间隔</option><option value="linear">线性增长</option></select></label><label>Key 调度策略<select name="keyStrategy"><option value="round-robin">轮询 Round Robin</option><option value="least-load">最低负载优先</option><option value="primary-first">固定首选</option></select></label><label>日志级别<select name="logLevel"><option>INFO</option><option>DEBUG</option><option>WARN</option><option>ERROR</option></select></label><label class="full">日志文件路径<input class="input" name="logFilePath"></label><label>每分钟最大请求数<input class="input" name="maxRequestsPerMinute" type="number"></label><label>并发连接上限<input class="input" name="maxConcurrentConnections" type="number"></label><label class="full" style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="logRequestBody" type="checkbox" style="width:auto">记录请求体（含敏感信息，仅调试时开启）</label></form></div>
         <div class="card"><h3 style="margin:0 0 12px">路由规则</h3><p style="margin:0 0 10px;color:#6b7280;font-size:12px">对应原型里的 Codex 入站路径、转换方式、出站路径。</p><div id="routeRows" class="grid"></div><button id="addRouteRow" class="btn btn-secondary" style="margin-top:10px">添加路由规则</button></div>
         <div class="card"><h3 style="margin:0 0 12px">模型映射</h3><p style="margin:0 0 10px;color:#6b7280;font-size:12px">请求体中的 model 字段会由 Hub 按当前厂商模型重写；这里保留映射参数用于可视化和后续扩展。</p><div id="modelRows" class="grid"></div><button id="addModelRow" class="btn btn-secondary" style="margin-top:10px">添加模型映射</button></div>
-      </div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">本地搜索</h3><p style="margin:0 0 12px;color:#6b7280">当提示需要实时信息时，Hub 可本地搜索并注入结果。</p><button id="toggleSearch" class="btn btn-secondary">切换本地搜索</button></div><div class="card"><h3 style="margin:0 0 12px">参数说明</h3><div class="notice">监听地址/端口当前由环境变量和启动常量决定，保存后会进入配置文件；需要下一步接线后才会驱动真实监听端口。超时、限流、Key 调度、路由规则已先作为可配置参数落盘。</div></div><div class="card"><h3 style="margin:0 0 12px">危险操作</h3><p style="margin:0 0 12px;color:#6b7280">恢复官方 OpenAI 配置会让 Codex 离开 Hub。</p><button id="uninstall" class="btn btn-danger">恢复官方配置</button></div></div></div></div></section>
+      </div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">本地搜索</h3><p style="margin:0 0 12px;color:#6b7280">当提示需要实时信息时，Hub 可本地搜索并注入结果。</p><button id="toggleSearch" class="btn btn-secondary">切换本地搜索</button></div><div class="card"><h3 style="margin:0 0 12px">参数说明</h3><div class="notice">监听地址/端口当前由环境变量和启动常量决定，保存后会进入配置文件；需要下一步接线后才会驱动真实监听端口。超时、限流、Key 调度、路由规则已先作为可配置参数落盘。</div></div></div></div></div></section>
     </main>
   </div>
-</div><div id="toast" class="toast"></div>
+</div>
+<div id="providerModal" class="modal-backdrop" hidden>
+  <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="providerFormTitle">
+    <div class="modal-head"><h3 id="providerFormTitle">添加厂商</h3><button id="closeProviderModal" class="icon-btn" type="button" aria-label="关闭">×</button></div>
+    <form id="providerForm" class="form">
+      <label>ID<input class="input" name="id" placeholder="deepseek"></label>
+      <label>显示名<input class="input" name="displayName" placeholder="DeepSeek"></label>
+      <label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option><option value="mimo">MiMo</option></select></label>
+      <label>模型<input class="input" name="model" placeholder="deepseek-chat"></label>
+      <label class="full">Base URL<input class="input" name="baseUrl" placeholder="https://api.deepseek.com/v1"></label>
+      <label class="full">API Key<div class="key-field"><input class="input" name="apiKey" type="password" placeholder="留空则沿用已保存密钥"><button id="toggleApiKeyVisibility" class="btn btn-secondary" type="button">显示</button></div></label>
+      <div class="modal-actions full"><button id="cancelProviderModal" class="btn btn-secondary" type="button">取消</button><button class="btn btn-primary" id="saveProvider">保存厂商</button></div>
+    </form>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
 <script>
 const AUTH_TOKEN = ${JSON.stringify(localAuthToken())};
 const $ = (id) => document.getElementById(id);
@@ -1307,10 +1401,14 @@ function toast(text){ const el=$('toast'); el.textContent=text; el.classList.add
 async function api(path, opts={}){ const headers={authorization:'Bearer '+AUTH_TOKEN,...(opts.headers||{})}; const res=await fetch(path,{cache:'no-store',...opts,headers}); const data=await res.json(); if(!res.ok||data.ok===false) throw new Error(data.message||data.error?.message||'request failed'); return data; }
 function nav(page){ document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.nav button[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('page-'+page).classList.add('active'); if(page==='logs') loadLogs(); }
 document.querySelectorAll('.nav button[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));
-function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(compact?' compact':'')+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const active=p.id===lastStatus.activeProvider; const usage=(lastStatus.usageStats?.byProvider||{})[p.id]||{}; const errorRate=usage.requests?((usage.errors||0)/usage.requests*100).toFixed(1):'0.0'; el.innerHTML='<div class="provider-main"><h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+'</div><div class="type url"></div><div class="row"></div></div>'+(compact?'':'<div class="provider-usage"><div><div class="usage-title">Token 用量</div><div class="usage-total"></div></div><div class="usage-grid"><div class="usage-mini"><strong data-k="requests"></strong><span>请求数</span></div><div class="usage-mini"><strong data-k="input"></strong><span>输入 Token</span></div><div class="usage-mini"><strong data-k="output"></strong><span>输出 Token</span></div></div><div style="font-size:12px;color:#6b7280"></div></div>'); el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; if(!compact){ el.querySelector('.usage-total').textContent=fmt(usage.totalTokens||0); el.querySelector('[data-k="requests"]').textContent=fmt(usage.requests||0); el.querySelector('[data-k="input"]').textContent=fmt(usage.inputTokens||0); el.querySelector('[data-k="output"]').textContent=fmt(usage.outputTokens||0); el.querySelector('.provider-usage').lastElementChild.textContent='错误率 '+errorRate+'%'+(usage.estimatedRequests?' · 估算 '+usage.estimatedRequests+' 次':''); } const sw=document.createElement('button'); sw.className=active?'btn btn-success':'btn btn-primary'; sw.textContent=active?'当前使用':'切换到此厂商'; sw.disabled=active; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
-async function refresh(){ lastStatus=await api('/api/status'); const enabled=!!lastStatus.gatewayEnabled; $('sideApi').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('apiUrl').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=enabled?(lastStatus.adapterRunning?'运行中':'按需启动'):'已关闭'; $('activeTitle').textContent=enabled?(lastStatus.activeProviderDisplayName||lastStatus.activeProvider):'官方 OpenAI'; $('activeSub').textContent=enabled?('当前 ID：'+lastStatus.activeProvider+' · 下一次 Codex 请求使用当前厂商'):'网关关闭时，Codex 使用官方 OpenAI 配置'; $('gatewaySubtitle').textContent=enabled?'网关开启：Codex 使用当前选择的厂商。':'网关关闭：Codex 使用官方 OpenAI。'; $('gatewayModeBadge').className='badge '+(enabled?'badge-success':'badge-danger'); $('gatewayModeBadge').textContent=enabled?'● 网关已开启':'● 网关已关闭'; $('gatewayToggle').className='btn '+(enabled?'btn-danger':'btn-primary'); $('gatewayToggle').textContent=enabled?'关闭网关':'开启网关'; updateUsageStats(lastStatus.usageStats||{}); const missing=lastStatus.providers.filter(p=>!p.hasKey).length; $('keyState').textContent=missing===0?'完整':missing+' 缺失'; $('sideStatus').className='status-pill '+(enabled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=enabled?'网关开启':'官方模式'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; lastStatus.providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); fillGatewaySettings(lastStatus.gateway||{}); }
-function fillProviderForm(p){ const f=$('providerForm'); enhanceSelects(f); f.elements.id.value=p.id||''; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.elements.apiKey.value=''; f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='编辑已保存厂商'; $('saveProvider').textContent='保存修改'; nav('providers'); toast((p.displayName||p.id)+' 已载入表单，API Key 留空会沿用已保存密钥。'); }
-function resetProviderForm(){ const f=$('providerForm'); f.reset(); f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='添加自定义厂商'; $('saveProvider').textContent='保存厂商'; }
+function notice(text){ const el=document.createElement('div'); el.className='notice'; el.textContent=text; return el; }
+function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(compact?' compact':'')+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const active=p.id===lastStatus.activeProvider; const usage=(lastStatus.usageStats?.byProvider||{})[p.id]||{}; const errorRate=usage.requests?((usage.errors||0)/usage.requests*100).toFixed(1):'0.0'; el.innerHTML='<div class="provider-main"><h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+'</div><div class="type url"></div><div class="row"></div></div>'+(compact?'':'<div class="provider-usage"><div><div class="usage-title">Token 用量</div><div class="usage-total"></div></div><div class="usage-grid"><div class="usage-mini"><strong data-k="requests"></strong><span>请求数</span></div><div class="usage-mini"><strong data-k="input"></strong><span>输入 Token</span></div><div class="usage-mini"><strong data-k="output"></strong><span>输出 Token</span></div></div><div style="font-size:12px;color:#6b7280"></div></div>'); el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; if(!compact){ el.querySelector('.usage-total').textContent=fmt(usage.totalTokens||0); el.querySelector('[data-k="requests"]').textContent=fmt(usage.requests||0); el.querySelector('[data-k="input"]').textContent=fmt(usage.inputTokens||0); el.querySelector('[data-k="output"]').textContent=fmt(usage.outputTokens||0); el.querySelector('.provider-usage').lastElementChild.textContent='错误率 '+errorRate+'%'+(usage.estimatedRequests?' · 估算 '+usage.estimatedRequests+' 次':''); } const sw=document.createElement('button'); sw.className=active?'btn btn-success':(p.hasKey?'btn btn-primary':'btn btn-secondary'); sw.textContent=active?'当前使用':(p.hasKey?'切换到此厂商':'缺少密钥'); sw.disabled=active||!p.hasKey; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
+async function refresh(){ lastStatus=await api('/api/status'); const providers=lastStatus.providers||[]; const activeProvider=providers.find(p=>p.id===lastStatus.activeProvider); const canUseProvider=!!(activeProvider&&activeProvider.hasKey); const enabled=!!lastStatus.gatewayEnabled; $('sideApi').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('apiUrl').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=enabled?(lastStatus.adapterRunning?'运行中':'按需启动'):'已关闭'; if(!providers.length){ $('activeTitle').textContent='尚未添加厂商'; $('activeSub').textContent='请先在厂商管理中手动添加厂商和 API Key。'; } else if(activeProvider){ $('activeTitle').textContent=activeProvider.displayName||activeProvider.id; $('activeSub').textContent='当前 ID：'+activeProvider.id+(enabled?' · 下一次 Codex 请求会走本地代理':' · 代理关闭时 Codex 使用官方 OpenAI'); } else { $('activeTitle').textContent='尚未选择厂商'; $('activeSub').textContent='请选择一个已保存密钥的厂商后再启动代理。'; } $('gatewaySubtitle').textContent=enabled?'代理已启动：Codex 使用当前厂商。':'代理已关闭：Codex 使用官方 OpenAI。'; $('gatewayModeBadge').className='badge '+(enabled?'badge-success':'badge-danger'); $('gatewayModeBadge').textContent=enabled?'● 代理已启动':'● 代理已关闭'; $('gatewayToggle').className='btn '+(enabled?'btn-danger':'btn-primary'); $('gatewayToggle').textContent=enabled?'关闭代理':'启动代理'; $('gatewayToggle').disabled=!enabled&&!canUseProvider; $('testActive').disabled=!canUseProvider; $('activeBadge').textContent=enabled?'Proxy':(canUseProvider?'Ready':'Manual'); updateUsageStats(lastStatus.usageStats||{}); const missing=providers.filter(p=>!p.hasKey).length; $('keyState').textContent=providers.length?(missing===0?'完整':missing+' 缺失'):'未配置'; $('sideStatus').className='status-pill '+(enabled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=enabled?'代理模式':'官方模式'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; if(!providers.length){ $('providers').append(notice('暂无厂商配置，请使用右侧表单手动添加。')); $('quickProviders').append(notice('暂无可切换厂商。')); } else { providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); } fillGatewaySettings(lastStatus.gateway||{}); }
+function setApiKeyVisible(visible){ const f=$('providerForm'); f.elements.apiKey.type=visible?'text':'password'; $('toggleApiKeyVisibility').textContent=visible?'隐藏':'显示'; }
+function resetProviderForm(){ const f=$('providerForm'); f.reset(); f.elements.id.readOnly=false; setApiKeyVisible(false); f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='添加厂商'; $('saveProvider').textContent='保存厂商'; }
+function openProviderModal(){ enhanceSelects($('providerForm')); $('providerModal').hidden=false; setTimeout(()=>$('providerForm').elements.id.focus(),0); }
+function closeProviderModal(){ $('providerModal').hidden=true; closeCustomSelects(); }
+async function fillProviderForm(p){ const f=$('providerForm'); resetProviderForm(); f.elements.id.value=p.id||''; f.elements.id.readOnly=true; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='编辑厂商'; $('saveProvider').textContent='保存修改'; openProviderModal(); try{ const key=await api('/api/provider-key?id='+encodeURIComponent(p.id)); f.elements.apiKey.value=key.apiKey||''; }catch(e){ f.elements.apiKey.value=''; toast(e.message); } }
 async function loadLogs(){ try{ const r=await api('/api/logs?limit=160'); $('logs').innerHTML=(r.lines.length?r.lines:['暂无日志']).map(line=>'<div></div>').join(''); [...$('logs').children].forEach((el,i)=>el.textContent=r.lines[i]||'暂无日志'); }catch(e){ $('logs').textContent=e.message; } }
 function closeCustomSelects(except){ document.querySelectorAll('.custom-select.open').forEach(el=>{ if(el!==except) el.classList.remove('open'); }); }
 function syncCustomSelect(select){ const wrap=select._customSelect; if(!wrap) return; const selected=select.options[select.selectedIndex]; wrap.querySelector('.custom-select-value').textContent=selected?.textContent||''; wrap.querySelectorAll('.custom-select-option').forEach((option)=>option.classList.toggle('selected', option.dataset.value===select.value)); }
@@ -1393,9 +1491,14 @@ $('addRouteRow').onclick=()=>$('routeRows').append(routeRow({enabled:true}));
 $('addModelRow').onclick=()=>$('modelRows').append(modelRow({enabled:true}));
 $('saveGatewaySettings').onclick=async()=>{ try{ const r=await api('/api/gateway-settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(collectGatewaySettings())}); toast(r.message); fillGatewaySettings(r.gateway); await refresh(); }catch(e){ toast(e.message); } };
 $('toggleSearch').onclick=async()=>{ try{ const enabled=!lastStatus.localSearch?.enabled; await api('/api/local-search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({enabled,onlyWhenLikelyNeeded:true})}); toast('本地搜索已'+(enabled?'开启':'关闭')); await refresh(); }catch(e){ toast(e.message); } };
-$('uninstall').onclick=async()=>{ if(!confirm('确定恢复官方 OpenAI 配置吗？当前配置会备份到 data/ 目录。')) return; try{ const r=await api('/api/uninstall-codex',{method:'POST'}); toast(r.message+' 备份：'+r.backupPath); await refresh(); }catch(e){ toast(e.message); } };
-$('providerForm').onsubmit=async(e)=>{ e.preventDefault(); try{ const data=Object.fromEntries(new FormData(e.currentTarget).entries()); const r=await api('/api/providers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); toast('已保存：'+(r.provider.displayName||r.provider.id)); resetProviderForm(); await refresh(); }catch(err){ toast(err.message); } };
-$('clearProviderForm').onclick=resetProviderForm; $('refreshLogs').onclick=loadLogs;
+$('providerForm').onsubmit=async(e)=>{ e.preventDefault(); try{ const data=Object.fromEntries(new FormData(e.currentTarget).entries()); const r=await api('/api/providers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); toast('已保存：'+(r.provider.displayName||r.provider.id)); closeProviderModal(); resetProviderForm(); await refresh(); }catch(err){ toast(err.message); } };
+$('clearProviderForm').onclick=()=>{ resetProviderForm(); openProviderModal(); };
+$('closeProviderModal').onclick=closeProviderModal;
+$('cancelProviderModal').onclick=closeProviderModal;
+$('providerModal').onclick=(event)=>{ if(event.target===$('providerModal')) closeProviderModal(); };
+$('toggleApiKeyVisibility').onclick=()=>setApiKeyVisible($('providerForm').elements.apiKey.type==='password');
+document.addEventListener('keydown',(event)=>{ if(event.key==='Escape'&&!$('providerModal').hidden) closeProviderModal(); });
+$('refreshLogs').onclick=loadLogs;
 enhanceSelects(); refresh().then(loadLogs).catch(e=>toast(e.message)); setInterval(()=>refresh().catch(()=>{}),5000);
 </script>
 </body>
@@ -1447,7 +1550,7 @@ process.on("SIGINT", () => { stopAdapter(); removeHubPid(); process.exit(0); });
 process.on("SIGTERM", () => { stopAdapter(); removeHubPid(); process.exit(0); });
 
 loadConfig();
-ensureCodexConfigInstalled();
+ensureProxyMode();
 writeHubPid();
 apiServer.listen(API_PORT, API_HOST, () => {
   console.log(`Codex Provider Hub API: http://${API_HOST}:${API_PORT}/v1`);

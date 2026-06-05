@@ -1,6 +1,6 @@
 # Codex Switcher
 
-Codex Switcher is a local provider hub for Codex Desktop. It gives Codex one stable local endpoint, then lets you switch between MiMo, FuseCode, OpenAI-compatible providers, and custom providers from a browser panel.
+Codex Switcher is a local provider hub for Codex Desktop. It gives Codex one stable local proxy endpoint, then lets you switch between manually added providers from a browser panel.
 
 ## What It Solves
 
@@ -12,25 +12,25 @@ Codex Switcher solves that by running a local hub:
 Codex Desktop
   -> http://127.0.0.1:8789/v1
   -> Codex Provider Hub
-      -> MiMo v2.5 Pro
-      -> FuseCode
-      -> custom OpenAI Chat Completions providers
-      -> custom Responses API providers
+      -> manually added OpenAI Chat Completions providers
+      -> manually added Responses API providers
+      -> manually added MiMo-compatible providers
 ```
 
-It also avoids repeatedly editing `~/.codex/config.toml`. Start the Hub once and it keeps Codex pointed at one stable local endpoint; later provider switches happen inside the Hub UI and apply on the next Codex request.
+It also avoids repeatedly editing `~/.codex/config.toml`. Add each provider manually in the Hub UI, then click **Start Proxy** to route Codex through the local endpoint. Click **Stop Proxy** to restore Codex to the official OpenAI configuration.
 
 ## Features
 
 - One stable Codex endpoint: `http://127.0.0.1:8789/v1`
 - Browser control panel: `http://127.0.0.1:8790`
 - macOS and Windows launch scripts
-- MiMo v2.5 Pro support through `mimo2codex`
-- FuseCode support through native Responses passthrough
+- MiMo-compatible support through `mimo2codex`
+- Native Responses API passthrough
 - Custom OpenAI Chat Completions providers
 - Custom Responses API providers
 - Local web-search enrichment that does not require MiMo's paid Web Search Plugin
 - Local provider/key storage under `data/`
+- No bundled default provider configs; every provider must be added by the user
 
 ## Folder Layout
 
@@ -78,7 +78,26 @@ npm install
 npm run app
 ```
 
-The desktop app starts or reuses the local Hub, opens the same control panel inside an app window, and keeps Codex pointed at the stable local endpoint.
+The desktop app starts or reuses the local Hub and opens the same control panel inside an app window.
+
+## Packaging
+
+Build distributable desktop installers from `codex-provider-hub`:
+
+```bash
+cd codex-provider-hub
+npm install
+npm run dist:mac   # macOS .dmg
+npm run dist:win   # Windows .exe installer, best run on Windows
+npm run dist       # both targets when the host supports them
+```
+
+Artifacts are written to `codex-provider-hub/dist/`:
+
+- macOS: `Codex Switcher-<version>-<arch>.dmg`
+- Windows: `Codex Switcher-Setup-<version>-x64.exe`
+
+For release builds, package on each target OS when possible. Cross-building the Windows installer from macOS may require Wine and Electron Builder's Windows helper downloads.
 
 ## Windows Usage
 
@@ -96,13 +115,13 @@ This will:
 
 ## Setup
 
-Start the Hub with the macOS or Windows launcher. The Hub automatically keeps Codex pointed at:
+Start the Hub with the macOS or Windows launcher. Add a provider in the control panel, then click **Start Proxy** to point Codex at:
 
 ```text
 http://127.0.0.1:8789/v1
 ```
 
-Open the control panel when you want to switch providers:
+Open the control panel when you want to add, test, switch, start, or stop the proxy:
 
 ```text
 http://127.0.0.1:8790
@@ -116,16 +135,11 @@ Use the Provider Hub panel at:
 http://127.0.0.1:8790
 ```
 
-Click a provider card to switch. The next Codex request uses the selected provider.
+There are no built-in provider entries. Add every provider manually, including API key, base URL, and model. Click a provider card to switch; when the proxy is running, the next Codex request uses the selected provider.
 
-The built-in providers are:
+## Adding a Provider
 
-- `mimo`: MiMo v2.5 Pro via `mimo2codex`
-- `fusecode`: FuseCode via native Responses passthrough
-
-## Adding a Custom Provider
-
-In the Hub panel, fill out **Add Custom OpenAI-Compatible Provider**.
+In the Hub panel, fill out **Add Provider**.
 
 For Chat Completions compatible providers, use:
 

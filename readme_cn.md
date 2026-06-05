@@ -2,7 +2,7 @@
 
 [English](./README.md) | 中文
 
-Codex Switcher 是一个本地厂商管理中心，为 Codex Desktop 提供统一入口。启动 Hub 后即可通过浏览器面板在 MiMo、FuseCode、OpenAI 兼容厂商和其他自定义厂商之间自由切换。
+Codex Switcher 是一个本地厂商管理中心，为 Codex Desktop 提供统一代理入口。所有厂商都需要用户在面板中手动添加，然后再启动代理使用。
 
 ## 解决什么问题
 
@@ -14,25 +14,25 @@ Codex Switcher 通过本地代理解决这个问题：
 Codex Desktop
   -> http://127.0.0.1:8789/v1
   -> Codex Provider Hub（本地代理）
-      -> MiMo v2.5 Pro
-      -> FuseCode
-      -> 自定义 OpenAI Chat Completions 厂商
-      -> 自定义 Responses API 厂商
+      -> 手动添加的 OpenAI Chat Completions 厂商
+      -> 手动添加的 Responses API 厂商
+      -> 手动添加的 MiMo 兼容厂商
 ```
 
-启动 Hub 后，它会自动把 Codex 指向固定本地入口。之后切换厂商只需在 Hub 面板点击，下一次 Codex 请求立即使用新厂商，无需再碰配置文件。
+启动 Hub 后，先在面板里手动添加厂商和密钥，再点击 **启动代理**。启动后 Codex 走本地代理；点击 **关闭代理** 后恢复为原先的官方 OpenAI 配置。
 
 ## 功能特性
 
 - 固定 Codex 入口：`http://127.0.0.1:8789/v1`
 - 浏览器控制面板：`http://127.0.0.1:8790`
 - 支持 macOS 和 Windows 一键启动
-- 通过 `mimo2codex` 支持 MiMo v2.5 Pro
-- 原生 Responses API 直通支持 FuseCode
+- 通过 `mimo2codex` 支持 MiMo 兼容厂商
+- 原生 Responses API 直通
 - 支持自定义 OpenAI Chat Completions 厂商
 - 支持自定义 Responses API 厂商
 - 本地联网搜索增强，无需 MiMo 付费搜索插件
 - 厂商配置和密钥本地存储在 `data/` 目录
+- 不再内置任何默认厂商配置，所有厂商都由用户手动添加
 
 ## 目录结构
 
@@ -95,17 +95,36 @@ npm install
 npm run app
 ```
 
-桌面应用会启动或复用本地 Hub，在应用窗口中打开同一个控制台，并自动保持 Codex 指向固定本地入口。
+桌面应用会启动或复用本地 Hub，并在应用窗口中打开同一个控制台。
+
+## 打包安装包
+
+在 `codex-provider-hub` 目录下构建桌面安装包：
+
+```bash
+cd codex-provider-hub
+npm install
+npm run dist:mac   # 生成 macOS .dmg
+npm run dist:win   # 生成 Windows .exe 安装器，建议在 Windows 上运行
+npm run dist       # 构建当前环境支持的全部目标
+```
+
+产物会输出到 `codex-provider-hub/dist/`：
+
+- macOS：`Codex Switcher-<version>-<arch>.dmg`
+- Windows：`Codex Switcher-Setup-<version>-x64.exe`
+
+正式发布建议分别在 macOS 和 Windows 环境打包。macOS 跨平台构建 Windows 安装器通常需要 Wine 以及 Electron Builder 的 Windows 辅助依赖。
 
 ## 使用方式
 
-使用上面的启动脚本运行 Hub。Hub 会自动维护 Codex 配置，让 Codex 始终通过以下固定入口访问模型：
+使用上面的启动脚本运行 Hub。先在控制面板中手动添加厂商，再点击 **启动代理**，Codex 会通过以下固定入口访问模型：
 
 ```text
 http://127.0.0.1:8789/v1
 ```
 
-需要切换厂商时打开控制面板：
+需要添加、测试、切换厂商或启动/关闭代理时打开控制面板：
 
 ```text
 http://127.0.0.1:8790
@@ -113,18 +132,11 @@ http://127.0.0.1:8790
 
 ## 切换厂商
 
-在控制面板 `http://127.0.0.1:8790` 中，点击厂商卡片即可切换。下一次 Codex 请求会自动使用新选择的厂商。
+控制面板不会预置任何厂商。先手动添加厂商、Base URL、模型和 API Key，再点击厂商卡片切换。代理启动后，下一次 Codex 请求会使用当前选择的厂商。
 
-内置厂商：
+## 添加厂商
 
-| 厂商 | 类型 | 说明 |
-|------|------|------|
-| `mimo` | mimo2codex 适配 | MiMo v2.5 Pro，通过 `mimo2codex` 做协议转换 |
-| `fusecode` | Responses API 直通 | FuseCode，原生支持 Responses API |
-
-## 添加自定义厂商
-
-在控制面板的 **添加自定义 OpenAI 兼容厂商** 表单中填写信息。
+在控制面板的 **添加自定义厂商** 表单中填写信息。
 
 **OpenAI Chat Completions 兼容厂商：**
 

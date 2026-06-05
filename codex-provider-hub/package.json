@@ -7,13 +7,107 @@
   "scripts": {
     "start": "node hub.js",
     "app": "electron .",
-    "app:dev": "electron ."
+    "app:dev": "electron .",
+    "clean:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "predist": "npm run clean:dist",
+    "predist:mac": "npm run clean:dist",
+    "predist:win": "npm run clean:dist",
+    "dist": "electron-builder --mac dmg --arm64 --x64 --win nsis --x64",
+    "dist:mac": "electron-builder --mac dmg --arm64 --x64",
+    "dist:win": "electron-builder --win nsis --x64"
   },
   "dependencies": {
     "mimo2codex": "0.5.20"
   },
   "main": "electron-main.js",
   "devDependencies": {
-    "electron": "^31.7.7"
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "productName": "Codex Switcher",
+  "author": "Codex Switcher",
+  "build": {
+    "appId": "cc.codex-switcher.app",
+    "productName": "Codex Switcher",
+    "asar": true,
+    "asarUnpack": [
+      "hub.js",
+      "node_modules/**/*"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "electron-main.js",
+      "hub.js",
+      "install-autostart.js",
+      "providers.example.json",
+      "README.md",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "build",
+        "to": "build",
+        "filter": [
+          "icon.png",
+          "trayTemplate.png"
+        ]
+      }
+    ],
+    "extraMetadata": {
+      "main": "electron-main.js"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "icon": "build/icon.icns",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ],
+      "sign": false
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }

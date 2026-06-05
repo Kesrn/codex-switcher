@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+codex-provider-hub/dist/
 
 # Runtime data and secrets
 data/
