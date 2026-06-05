@@ -82,7 +82,7 @@ codex-provider-hub/open-windows.cmd
 脚本会自动完成以下步骤：
 
 1. 安装 npm 依赖（如尚未安装）
-2. 在后台启动 Hub 服务
+2. 注册 Windows 启动项并在后台启动 Hub 服务
 3. 打开控制面板 `http://127.0.0.1:8790`
 
 ## 使用方式

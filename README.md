@@ -79,7 +79,7 @@ codex-provider-hub/open-windows.cmd
 This will:
 
 1. Install npm dependencies if needed.
-2. Start the Hub in the background.
+2. Register a Startup shortcut for the Hub.
 3. Open the control panel at `http://127.0.0.1:8790`.
 
 ## Setup

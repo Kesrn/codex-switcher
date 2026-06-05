@@ -196,9 +196,7 @@ function windowsInstallStartup() {
     "@echo off",
     `set "CODEX_PROVIDER_HUB_DATA_DIR=${cmdEscape(dataDir)}"`,
     `cd /d "${cmdEscape(ROOT)}"`,
-    `if not exist "${cmdEscape(pidFilePath())}" (`,
-    `  start "" /min "${cmdEscape(NODE)}" "${cmdEscape(HUB)}"`,
-    ")",
+    `"${cmdEscape(NODE)}" "${cmdEscape(path.join(ROOT, "install-autostart.js"))}" start`,
     ""
   ].join("\r\n");
   

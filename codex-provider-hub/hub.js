@@ -761,7 +761,7 @@ name = "Codex Provider Hub"
 base_url = "http://127.0.0.1:${API_PORT}/v1"
 wire_api = "responses"
 requires_openai_auth = true
-request_max_retries = 1`;
+request_max_retries = 3`;
   const next = setTopLevel(upsertSection(existing, "model_providers.provider-hub", providerBlock), {
     model_provider: "\"provider-hub\"",
     model: "\"current\"",
