@@ -5,9 +5,15 @@
   "description": "Cross-platform local provider hub for Codex Desktop.",
   "type": "commonjs",
   "scripts": {
-    "start": "node hub.js"
+    "start": "node hub.js",
+    "app": "electron .",
+    "app:dev": "electron ."
   },
   "dependencies": {
     "mimo2codex": "0.5.20"
+  },
+  "main": "electron-main.js",
+  "devDependencies": {
+    "electron": "^31.7.7"
   }
 }

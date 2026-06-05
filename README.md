@@ -68,6 +68,18 @@ This will:
 2. Register a LaunchAgent for the Hub.
 3. Open the control panel at `http://127.0.0.1:8790`.
 
+## Desktop App
+
+The Hub can also run as an Electron desktop app, so you do not need to use an external browser:
+
+```bash
+cd codex-provider-hub
+npm install
+npm run app
+```
+
+The desktop app starts or reuses the local Hub, opens the same control panel inside an app window, and keeps Codex pointed at the stable local endpoint.
+
 ## Windows Usage
 
 Open:
@@ -149,6 +161,12 @@ Run the Hub manually:
 cd codex-provider-hub
 npm install
 npm start
+```
+
+Run the desktop app during development:
+
+```bash
+npm run app
 ```
 
 Useful URLs:

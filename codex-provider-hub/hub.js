@@ -878,9 +878,24 @@ async function readJsonBody(req) {
   return JSON.parse(await readRequestBody(req) || "{}");
 }
 
+function readRecentLogLines(limit = 120) {
+  try {
+    const text = readText(LOG_PATH);
+    return text.split(/\r?\n/).filter(Boolean).slice(-limit).reverse();
+  } catch {
+    return [];
+  }
+}
+
 async function handleApi(req, res) {
   if (req.method === "GET" && req.url === "/api/status") {
     sendJson(res, 200, await statusPayload());
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/logs")) {
+    const url = new URL(req.url, `http://${API_HOST}:${UI_PORT}`);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 120)));
+    sendJson(res, 200, { ok: true, lines: readRecentLogLines(limit) });
     return;
   }
   if (req.method === "POST" && req.url === "/api/install-codex") {
@@ -1006,182 +1021,65 @@ function html() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Provider Hub</title>
-  <style>
-    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --ink:#1f2937; --muted:#667085; --line:#d7dce3; --brand:#0f766e; --dark:#334155; --warn:#b45309; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--ink); }
-    main { width:min(1120px, calc(100% - 28px)); margin:0 auto; padding:26px 0 36px; }
-    header { display:flex; justify-content:space-between; gap:18px; align-items:flex-end; border-bottom:1px solid var(--line); padding-bottom:18px; }
-    h1 { margin:0 0 5px; font-size:30px; line-height:1.15; letter-spacing:0; }
-    p { margin:0; }
-    .sub { color:var(--muted); font-size:14px; }
-    .pill { border:1px solid #9dd8cd; color:var(--brand); background:#e7f6f2; padding:7px 13px; border-radius:999px; font-weight:700; white-space:nowrap; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:18px; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; box-shadow:0 8px 20px rgba(31,41,55,.05); }
-    .wide { grid-column:1 / -1; }
-    h2 { margin:0 0 12px; font-size:17px; letter-spacing:0; }
-    dl { display:grid; grid-template-columns:140px 1fr; gap:9px 12px; margin:0; font-size:14px; }
-    dt { color:var(--muted); }
-    dd { margin:0; font-weight:650; word-break:break-word; }
-    .providers { display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:10px; }
-    .provider { border:1px solid var(--line); border-radius:8px; padding:12px; background:#fbfcfd; }
-    .provider.active { border-color:#8bd4c7; background:#ecf8f5; }
-    .provider h3 { margin:0 0 7px; font-size:15px; letter-spacing:0; }
-    .meta { color:var(--muted); font-size:12px; line-height:1.5; }
-    button { border:0; border-radius:8px; min-height:38px; padding:0 13px; font-weight:750; cursor:pointer; color:#fff; background:var(--brand); }
-    button.secondary { background:var(--dark); }
-    button.light { color:var(--ink); background:#fff; border:1px solid var(--line); }
-    button:disabled { opacity:.65; cursor:wait; }
-    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; }
-    form { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    label { display:grid; gap:5px; font-size:13px; color:var(--muted); }
-    input, select { min-height:38px; border:1px solid var(--line); border-radius:8px; padding:0 10px; font:inherit; background:#fff; color:var(--ink); }
-    .full { grid-column:1 / -1; }
-    pre { margin:12px 0 0; padding:12px; max-height:180px; overflow:auto; border-radius:8px; background:#111827; color:#f9fafb; font-size:12px; line-height:1.5; }
-    .notice { margin-top:10px; border:1px solid #f0cf9d; color:var(--warn); background:#fff7e8; padding:10px 12px; border-radius:8px; font-size:13px; line-height:1.45; }
-    @media (max-width:760px) { header { align-items:flex-start; flex-direction:column; } .grid, form { grid-template-columns:1fr; } .wide { grid-column:auto; } dl { grid-template-columns:110px 1fr; } }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Switcher</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}body{margin:0;min-height:100vh;font:13px/1.45 "Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:#1f2328;background:#6e6e6e;display:grid;place-items:center;padding:18px}button,input,select{font:inherit}.window{width:min(1240px,calc(100vw - 24px));height:min(780px,calc(100vh - 24px));background:#f3f4f6;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.34),0 0 0 1px rgba(0,0,0,.14);display:flex;flex-direction:column}.titlebar{height:34px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 16px;user-select:none}.title-left{display:flex;align-items:center;gap:9px;color:#6b7280;font-size:12px}.app-icon{width:16px;height:16px;border-radius:4px;background:#2563eb;display:grid;place-items:center;color:white;font-weight:800;font-size:11px}.traffic{display:flex}.traffic button{width:42px;height:32px;border:0;background:transparent;color:#6b7280}.traffic button:hover{background:#f3f4f6}.traffic .close:hover{background:#dc2626;color:white}.shell{flex:1;min-height:0;display:flex}.sidebar{width:230px;background:#fff;border-right:1px solid #e5e7eb;display:flex;flex-direction:column}.brand{padding:18px 16px 10px}.brand h1{font-size:16px;line-height:1.1;margin:0;color:#111827;letter-spacing:-.02em}.brand p{margin:3px 0 0;color:#6b7280;font-size:11px}.status-pill{margin-top:12px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:700}.status-pill.ok{background:#ecfdf5;color:#15803d}.status-pill.warn{background:#fff7ed;color:#c2410c}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}.nav-label{padding:14px 16px 5px;color:#8b949e;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.07em}.nav{padding:0 8px}.nav button{width:100%;height:36px;border:0;border-radius:7px;background:transparent;color:#6b7280;display:flex;align-items:center;gap:10px;padding:0 10px;text-align:left;cursor:pointer}.nav button:hover{background:#f3f4f6;color:#111827}.nav button.active{background:#eaf1ff;color:#2563eb;font-weight:700}.sidebar-footer{margin-top:auto;padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:11px}.content{flex:1;min-width:0;display:flex;flex-direction:column}.page{display:none;min-height:0;flex:1;flex-direction:column}.page.active{display:flex}.page-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:20px 24px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.page-title{font-size:19px;font-weight:800;letter-spacing:-.025em;color:#111827}.page-sub{margin-top:3px;color:#6b7280;font-size:12px}.page-body{padding:20px 24px;overflow:auto}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:7px;min-height:34px;padding:0 13px;display:inline-flex;align-items:center;gap:7px;font-weight:750;cursor:pointer}.btn-primary{background:#2563eb;color:white}.btn-primary:hover{background:#1d4ed8}.btn-secondary{background:#fff;color:#111827;border:1px solid #d1d5db}.btn-secondary:hover{background:#f9fafb}.btn-danger{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.btn-success{background:#ecfdf5;color:#15803d;border:1px solid #bbf7d0}.btn:disabled{opacity:.55;cursor:not-allowed}.grid{display:grid;gap:14px}.stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px}.stat-label{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.stat-value{font-size:26px;font-weight:850;letter-spacing:-.03em;margin-top:4px;color:#111827}.stat-note{font-size:11px;color:#6b7280;margin-top:4px}.hero{display:flex;justify-content:space-between;gap:24px;align-items:center;background:linear-gradient(135deg,#fff,#f8fbff);border:1px solid #dbeafe;border-radius:12px;padding:18px 20px;margin-bottom:18px}.hero h2{font-size:17px;margin:0;color:#111827}.hero p{margin:4px 0 0;color:#6b7280}.meta{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}.meta div{font-size:12px;color:#6b7280}.meta code,.code{font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:11px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;padding:2px 6px;color:#111827}.providers{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.provider{position:relative;background:#fff;border:1px solid #e5e7eb;border-radius:11px;padding:15px;transition:.14s}.provider:hover{border-color:#bfdbfe;box-shadow:0 8px 24px rgba(37,99,235,.08)}.provider.active{border-color:#60a5fa;background:#f8fbff}.provider h3{margin:0;font-size:15px;color:#111827}.provider .type{margin-top:7px;color:#6b7280;font-size:12px;display:flex;gap:6px;flex-wrap:wrap}.provider .row{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:750}.badge-ok{background:#ecfdf5;color:#15803d}.badge-warn{background:#fff7ed;color:#c2410c}.badge-blue{background:#eaf1ff;color:#2563eb}.badge-muted{background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb}.split{grid-template-columns:1fr 360px;align-items:start}.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.form label{display:grid;gap:5px;color:#6b7280;font-size:12px}.form .full{grid-column:1/-1}.input,select{height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 10px}.input:focus,select:focus{outline:2px solid #bfdbfe;border-color:#60a5fa}.logbox{height:430px;overflow:auto;background:#0b1220;color:#dbeafe;border-radius:10px;border:1px solid #111827;padding:13px;font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:12px;line-height:1.6}.logbox div{white-space:pre-wrap;border-bottom:1px solid rgba(255,255,255,.06);padding:3px 0}.notice{border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;border-radius:9px;padding:12px;font-size:12px}.toast{position:fixed;right:28px;bottom:28px;max-width:460px;background:#111827;color:#fff;border-radius:10px;padding:12px 14px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:none;z-index:10}.toast.show{display:block}@media(max-width:900px){body{padding:0}.window{width:100vw;height:100vh;border-radius:0}.sidebar{width:200px}.stats,.split{grid-template-columns:1fr}.form{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.page-header{flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}}
+</style>
 </head>
 <body>
-<main>
-  <header>
-    <div>
-      <h1>Codex Provider Hub</h1>
-      <p class="sub">一个本地入口管理多个厂商。Codex 固定连 Hub，切换厂商不再反复改配置。</p>
-    </div>
-    <div id="pill" class="pill">读取中</div>
-  </header>
-  <section class="grid">
-    <div class="panel">
-      <h2>Hub 状态</h2>
-      <dl>
-        <dt>API</dt><dd id="apiUrl">-</dd>
-        <dt>数据目录</dt><dd id="dataDir">-</dd>
-        <dt>Codex 配置</dt><dd id="installed">-</dd>
-        <dt>Adapter</dt><dd id="adapter">-</dd>
-      </dl>
-      <div class="row"><button id="install">重新同步 Codex 配置</button><button class="secondary" id="testActive">测试当前厂商</button><button class="light" id="refresh">刷新</button></div>
-      <div class="row"><button class="light" id="uninstall" style="color:#b45309;border-color:#f0cf9d;">恢复官方配置</button></div>
-      <div class="notice">启动 Hub 后会自动同步 Codex 到固定本地入口。之后只需在这里点厂商卡片，下一次 Codex 请求立即使用新厂商。</div>
-    </div>
-    <div class="panel">
-      <h2>联网搜索</h2>
-      <dl>
-        <dt>状态</dt><dd id="searchStatus">-</dd>
-        <dt>触发策略</dt><dd id="searchMode">-</dd>
-      </dl>
-      <div class="row"><button class="secondary" id="toggleSearch">切换搜索</button></div>
-    </div>
-    <div class="panel wide">
-      <h2>厂商</h2>
-      <div class="providers" id="providers"></div>
-    </div>
-    <div class="panel wide">
-      <h2 id="providerFormTitle">添加自定义 OpenAI 兼容厂商</h2>
-      <form id="providerForm">
-        <label>ID<input name="id" placeholder="qwen"></label>
-        <label>显示名<input name="displayName" placeholder="Qwen"></label>
-        <label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option></select></label>
-        <label>模型<input name="model" placeholder="qwen3-coder-plus"></label>
-        <label class="full">Base URL<input name="baseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"></label>
-        <label class="full">API Key<input name="apiKey" type="password" placeholder="留空则沿用已保存密钥"></label>
-        <div class="row full"><button id="saveProvider">保存厂商</button><button type="button" class="light" id="clearProviderForm">新增厂商</button></div>
-      </form>
-      <pre id="log" hidden></pre>
-    </div>
-  </section>
-</main>
+<div class="window">
+  <div class="titlebar"><div class="title-left"><span class="app-icon">C</span><span>Codex Switcher</span></div><div class="traffic"><button>—</button><button>□</button><button class="close">×</button></div></div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><h1>Codex Switcher</h1><p>本地模型厂商控制台</p><div id="sideStatus" class="status-pill ok"><span class="dot"></span><span>读取中</span></div></div>
+      <div class="nav-label">Workspace</div><nav class="nav">
+        <button class="active" data-page="overview">⌘ 概览</button>
+        <button data-page="providers">▦ 厂商</button>
+        <button data-page="logs">≡ 日志</button>
+        <button data-page="settings">⚙ 设置</button>
+      </nav>
+      <div class="nav-label">Quick Links</div><nav class="nav"><button id="openApi">↗ API 入口</button><button id="refreshAll">⟳ 刷新状态</button></nav>
+      <div class="sidebar-footer"><div>固定入口</div><div><code id="sideApi" class="code">127.0.0.1</code></div></div>
+    </aside>
+    <main class="content">
+      <section id="page-overview" class="page active">
+        <header class="page-header"><div><div class="page-title">运行概览</div><div class="page-sub">Codex 固定连接 Hub，厂商切换在下一次请求生效。</div></div><div class="actions"><button id="testActive" class="btn btn-primary">测试当前厂商</button><button id="syncCodex" class="btn btn-secondary">同步 Codex 配置</button></div></header>
+        <div class="page-body">
+          <div class="hero"><div><h2 id="activeTitle">当前厂商</h2><p id="activeSub">读取中...</p><div class="meta"><div>API <code id="apiUrl">-</code></div><div>数据目录 <code id="dataDir">-</code></div><div>Adapter <code id="adapterState">-</code></div></div></div><span id="activeBadge" class="badge badge-blue">Current</span></div>
+          <div class="grid stats"><div class="card"><div class="stat-label">厂商数量</div><div id="providerCount" class="stat-value">-</div><div class="stat-note">已配置 providers</div></div><div class="card"><div class="stat-label">Codex 配置</div><div id="codexState" class="stat-value">-</div><div class="stat-note">启动时自动同步</div></div><div class="card"><div class="stat-label">本地搜索</div><div id="searchState" class="stat-value">-</div><div class="stat-note" id="searchNote">DuckDuckGo 注入</div></div><div class="card"><div class="stat-label">密钥状态</div><div id="keyState" class="stat-value">-</div><div class="stat-note">缺失时不可切换</div></div></div>
+          <div class="grid split"><div class="card"><h3 style="margin:0 0 12px">快速切换</h3><div id="quickProviders" class="grid providers"></div></div><div class="card"><h3 style="margin:0 0 12px">操作反馈</h3><div id="messagePanel" class="notice">准备就绪。选择厂商后，下次 Codex 请求会使用新厂商。</div></div></div>
+        </div>
+      </section>
+      <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div class="grid split"><div><div id="providers" class="grid providers"></div></div><div class="card"><h3 id="providerFormTitle" style="margin:0 0 12px">添加自定义厂商</h3><form id="providerForm" class="form"><label>ID<input class="input" name="id" placeholder="deepseek"></label><label>显示名<input class="input" name="displayName" placeholder="DeepSeek"></label><label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option><option value="mimo">MiMo</option></select></label><label>模型<input class="input" name="model" placeholder="deepseek-chat"></label><label class="full">Base URL<input class="input" name="baseUrl" placeholder="https://api.deepseek.com/v1"></label><label class="full">API Key<input class="input" name="apiKey" type="password" placeholder="留空则沿用已保存密钥"></label><button class="btn btn-primary full" id="saveProvider">保存厂商</button></form></div></div></div></section>
+      <section id="page-logs" class="page"><header class="page-header"><div><div class="page-title">运行日志</div><div class="page-sub">读取本地 data/hub.log，便于排查切换和适配器状态。</div></div><div class="actions"><button id="refreshLogs" class="btn btn-secondary">刷新日志</button></div></header><div class="page-body"><div id="logs" class="logbox">读取中...</div></div></section>
+      <section id="page-settings" class="page"><header class="page-header"><div><div class="page-title">设置</div><div class="page-sub">管理 Codex 接入、本地搜索和恢复官方配置。</div></div></header><div class="page-body"><div class="grid split"><div class="card"><h3 style="margin:0 0 12px">本地搜索</h3><p style="margin:0 0 12px;color:#6b7280">当提示需要实时信息时，Hub 可本地搜索并注入结果。</p><button id="toggleSearch" class="btn btn-secondary">切换本地搜索</button></div><div class="card"><h3 style="margin:0 0 12px">危险操作</h3><p style="margin:0 0 12px;color:#6b7280">恢复官方 OpenAI 配置会让 Codex 离开 Hub。</p><button id="uninstall" class="btn btn-danger">恢复官方配置</button></div></div></div></section>
+    </main>
+  </div>
+</div><div id="toast" class="toast"></div>
 <script>
-const $ = (id) => document.getElementById(id);
 const AUTH_TOKEN = ${JSON.stringify(localAuthToken())};
+const $ = (id) => document.getElementById(id);
 let lastStatus = null;
-function log(text) { $("log").hidden = false; $("log").textContent = text; }
-async function api(path, opts = {}) {
-  const headers = { authorization:"Bearer " + AUTH_TOKEN, ...(opts.headers || {}) };
-  const res = await fetch(path, { cache:"no-store", ...opts, headers });
-  const data = await res.json();
-  if (!res.ok || data.ok === false) throw new Error(data.message || data.error?.message || "request failed");
-  return data;
-}
-async function refresh() {
-  lastStatus = await api("/api/status");
-  $("pill").textContent = "当前：" + (lastStatus.activeProviderDisplayName || lastStatus.activeProvider);
-  $("apiUrl").textContent = lastStatus.apiUrl;
-  $("dataDir").textContent = lastStatus.dataDir;
-  $("installed").textContent = lastStatus.codexInstalled ? "已安装" : "未安装";
-  $("adapter").textContent = lastStatus.adapterRunning ? "运行中" : "按需启动";
-  $("searchStatus").textContent = lastStatus.localSearch?.enabled ? "开启" : "关闭";
-  $("searchMode").textContent = lastStatus.localSearch?.onlyWhenLikelyNeeded ? "只在实时问题触发" : "每次 web_search 都触发";
-  $("providers").innerHTML = "";
-  for (const p of lastStatus.providers) {
-    const el = document.createElement("div");
-    el.className = "provider" + (p.id === lastStatus.activeProvider ? " active" : "");
-    el.innerHTML = '<h3></h3><div class="meta"></div><div class="row"></div>';
-    el.querySelector("h3").textContent = p.displayName || p.id;
-    el.querySelector(".meta").textContent = [p.type, p.model, p.baseUrl, p.hasKey ? "key: yes" : "key: missing"].filter(Boolean).join(" · ");
-    const btn = document.createElement("button");
-    btn.textContent = p.id === lastStatus.activeProvider ? "当前使用" : "切换到此厂商";
-    btn.disabled = p.id === lastStatus.activeProvider;
-    btn.onclick = async () => { await api("/api/switch", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify({ id:p.id }) }); await refresh(); };
-    el.querySelector(".row").append(btn);
-    const editBtn = document.createElement("button");
-    editBtn.className = "light";
-    editBtn.textContent = "编辑";
-    editBtn.onclick = () => fillProviderForm(p);
-    el.querySelector(".row").append(editBtn);
-    $("providers").append(el);
-  }
-}
-function fillProviderForm(provider) {
-  const form = $("providerForm");
-  form.elements.id.value = provider.id || "";
-  form.elements.displayName.value = provider.displayName || provider.id || "";
-  form.elements.type.value = provider.type || "openai-chat";
-  form.elements.model.value = provider.model || "";
-  form.elements.baseUrl.value = provider.baseUrl || "";
-  form.elements.apiKey.value = "";
-  $("providerFormTitle").textContent = "编辑已保存厂商";
-  $("saveProvider").textContent = "保存修改";
-  log((provider.displayName || provider.id) + " 已载入表单。API Key 留空会继续使用本机已保存密钥。");
-  form.scrollIntoView({ behavior:"smooth", block:"start" });
-}
-function resetProviderForm() {
-  const form = $("providerForm");
-  form.reset();
-  $("providerFormTitle").textContent = "添加自定义 OpenAI 兼容厂商";
-  $("saveProvider").textContent = "保存厂商";
-}
-$("refresh").onclick = refresh;
-$("install").onclick = async () => { const r = await api("/api/install-codex", { method:"POST" }); log(r.message); await refresh(); };
-$("uninstall").onclick = async () => {
-  if (!confirm("确定要恢复官方 OpenAI 配置吗？\\n\\n当前配置会备份到 data/ 目录，之后可以手动恢复。")) return;
-  const r = await api("/api/uninstall-codex", { method:"POST" }); log(r.message + "\\n备份: " + r.backupPath); await refresh();
-};
-$("testActive").onclick = async () => {
-  log("正在测试当前厂商...");
-  const r = await api("/api/test-active", { method:"POST" });
-  log("测试通过: HTTP " + r.status + " · " + r.latencyMs + "ms · " + r.sample);
-  await refresh();
-};
-$("toggleSearch").onclick = async () => {
-  const enabled = !lastStatus.localSearch?.enabled;
-  await api("/api/local-search", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify({ enabled, onlyWhenLikelyNeeded:true }) });
-  await refresh();
-};
-$("providerForm").onsubmit = async (event) => {
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-  const r = await api("/api/providers", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify(data) });
-  log("已保存：" + (r.provider.displayName || r.provider.id));
-  resetProviderForm();
-  await refresh();
-};
-$("clearProviderForm").onclick = resetProviderForm;
-refresh().catch((error) => log(error.message));
-setInterval(() => refresh().catch(() => {}), 5000);
+function toast(text){ const el=$('toast'); el.textContent=text; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),3500); $('messagePanel') && ($('messagePanel').textContent=text); }
+async function api(path, opts={}){ const headers={authorization:'Bearer '+AUTH_TOKEN,...(opts.headers||{})}; const res=await fetch(path,{cache:'no-store',...opts,headers}); const data=await res.json(); if(!res.ok||data.ok===false) throw new Error(data.message||data.error?.message||'request failed'); return data; }
+function nav(page){ document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.nav button[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('page-'+page).classList.add('active'); if(page==='logs') loadLogs(); }
+document.querySelectorAll('.nav button[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));
+function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const active=p.id===lastStatus.activeProvider; el.innerHTML='<h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+'</div><div class="type url"></div><div class="row"></div>'; el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; const sw=document.createElement('button'); sw.className=active?'btn btn-success':'btn btn-primary'; sw.textContent=active?'当前使用':'切换到此厂商'; sw.disabled=active; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
+async function refresh(){ lastStatus=await api('/api/status'); $('sideApi').textContent=lastStatus.apiUrl; $('apiUrl').textContent=lastStatus.apiUrl; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=lastStatus.adapterRunning?'运行中':'按需启动'; $('activeTitle').textContent=lastStatus.activeProviderDisplayName||lastStatus.activeProvider; $('activeSub').textContent='当前 ID：'+lastStatus.activeProvider+' · 下一次 Codex 请求生效'; $('providerCount').textContent=lastStatus.providers.length; $('codexState').textContent=lastStatus.codexInstalled?'已接入':'未接入'; $('searchState').textContent=lastStatus.localSearch?.enabled?'开启':'关闭'; $('searchNote').textContent=lastStatus.localSearch?.onlyWhenLikelyNeeded?'只在需要时触发':'每次 web_search 触发'; const missing=lastStatus.providers.filter(p=>!p.hasKey).length; $('keyState').textContent=missing===0?'完整':missing+' 缺失'; $('sideStatus').className='status-pill '+(lastStatus.codexInstalled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=lastStatus.codexInstalled?'Hub 运行中':'待同步'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; lastStatus.providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); }
+function fillProviderForm(p){ const f=$('providerForm'); f.elements.id.value=p.id||''; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.elements.apiKey.value=''; $('providerFormTitle').textContent='编辑已保存厂商'; $('saveProvider').textContent='保存修改'; nav('providers'); toast((p.displayName||p.id)+' 已载入表单，API Key 留空会沿用已保存密钥。'); }
+function resetProviderForm(){ const f=$('providerForm'); f.reset(); $('providerFormTitle').textContent='添加自定义厂商'; $('saveProvider').textContent='保存厂商'; }
+async function loadLogs(){ try{ const r=await api('/api/logs?limit=160'); $('logs').innerHTML=(r.lines.length?r.lines:['暂无日志']).map(line=>'<div></div>').join(''); [...$('logs').children].forEach((el,i)=>el.textContent=r.lines[i]||'暂无日志'); }catch(e){ $('logs').textContent=e.message; } }
+$('refreshAll').onclick=()=>refresh().then(()=>toast('状态已刷新')).catch(e=>toast(e.message));
+$('openApi').onclick=()=>navigator.clipboard?.writeText(lastStatus?.apiUrl||'').then(()=>toast('API 地址已复制'));
+$('syncCodex').onclick=async()=>{ try{ const r=await api('/api/install-codex',{method:'POST'}); toast(r.message); await refresh(); }catch(e){ toast(e.message); } };
+$('testActive').onclick=async()=>{ try{ toast('正在测试当前厂商...'); const r=await api('/api/test-active',{method:'POST'}); toast('测试通过 HTTP '+r.status+' · '+r.latencyMs+'ms · '+r.sample); await refresh(); }catch(e){ toast(e.message); } };
+$('toggleSearch').onclick=async()=>{ try{ const enabled=!lastStatus.localSearch?.enabled; await api('/api/local-search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({enabled,onlyWhenLikelyNeeded:true})}); toast('本地搜索已'+(enabled?'开启':'关闭')); await refresh(); }catch(e){ toast(e.message); } };
+$('uninstall').onclick=async()=>{ if(!confirm('确定恢复官方 OpenAI 配置吗？当前配置会备份到 data/ 目录。')) return; try{ const r=await api('/api/uninstall-codex',{method:'POST'}); toast(r.message+' 备份：'+r.backupPath); await refresh(); }catch(e){ toast(e.message); } };
+$('providerForm').onsubmit=async(e)=>{ e.preventDefault(); try{ const data=Object.fromEntries(new FormData(e.currentTarget).entries()); const r=await api('/api/providers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); toast('已保存：'+(r.provider.displayName||r.provider.id)); resetProviderForm(); await refresh(); }catch(err){ toast(err.message); } };
+$('clearProviderForm').onclick=resetProviderForm; $('refreshLogs').onclick=loadLogs;
+refresh().then(loadLogs).catch(e=>toast(e.message)); setInterval(()=>refresh().catch(()=>{}),5000);
 </script>
 </body>
 </html>`;

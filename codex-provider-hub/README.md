@@ -22,6 +22,14 @@ The UI opens at:
 http://127.0.0.1:8790
 ```
 
+Desktop app mode:
+
+```bash
+npm run app
+```
+
+The Electron app starts or reuses the local Hub and displays the control panel in an app window.
+
 Codex should point to:
 
 ```text
