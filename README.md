@@ -18,7 +18,7 @@ Codex Desktop
       -> custom Responses API providers
 ```
 
-It also avoids repeatedly editing `~/.codex/config.toml`. Install the Hub once, restart Codex once, and later provider switches happen inside the Hub UI.
+It also avoids repeatedly editing `~/.codex/config.toml`. Start the Hub once and it keeps Codex pointed at one stable local endpoint; later provider switches happen inside the Hub UI and apply on the next Codex request.
 
 ## Features
 
@@ -82,22 +82,18 @@ This will:
 2. Start the Hub in the background.
 3. Open the control panel at `http://127.0.0.1:8790`.
 
-## First-Time Setup
+## Setup
 
-1. Start the Hub with the macOS or Windows launcher.
-2. Open the control panel:
-
-   ```text
-   http://127.0.0.1:8790
-   ```
-
-3. Click **Install to Codex**.
-4. Fully quit and reopen Codex Desktop once.
-
-After that, Codex will always connect to:
+Start the Hub with the macOS or Windows launcher. The Hub automatically keeps Codex pointed at:
 
 ```text
 http://127.0.0.1:8789/v1
+```
+
+Open the control panel when you want to switch providers:
+
+```text
+http://127.0.0.1:8790
 ```
 
 ## Switching Providers

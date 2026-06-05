@@ -28,7 +28,7 @@ Codex should point to:
 http://127.0.0.1:8789/v1
 ```
 
-Use **Install to Codex** once, restart Codex once, then switch providers in the Hub UI.
+The Hub automatically keeps Codex pointed at this local endpoint while it is running. Switch providers in the Hub UI; the next Codex request uses the selected provider.
 
 Runtime data is stored next to this folder:
 

@@ -709,9 +709,17 @@ async function ensureAdapter(provider) {
 }
 
 function rewriteModel(payload, provider) {
-  if (provider.model && (!payload.model || payload.model === "current" || payload.model === provider.id)) {
+  if (provider.model) {
     payload.model = provider.model;
   }
+}
+
+async function prepareProviderForSwitch(provider) {
+  assertProviderBaseUrl(provider);
+  if (!providerKey(provider)) {
+    throw new Error(`Provider ${provider.displayName || provider.id} has no API key.`);
+  }
+  if (provider.type !== "responses") await ensureAdapter(provider);
 }
 
 async function handleResponses(req, res) {
@@ -765,6 +773,15 @@ request_max_retries = 1`;
   const config = loadConfig();
   config.codexInstalled = true;
   saveConfig(config);
+}
+
+function ensureCodexConfigInstalled() {
+  try {
+    installCodexConfig();
+    appendLog("codex config ensured", { path: CODEX_CONFIG_PATH });
+  } catch (error) {
+    appendLog("codex config ensure failed", { message: error.message });
+  }
 }
 
 function restoreOpenAIConfig() {
@@ -868,20 +885,32 @@ async function handleApi(req, res) {
   }
   if (req.method === "POST" && req.url === "/api/install-codex") {
     installCodexConfig();
-    sendJson(res, 200, { ok: true, message: "Codex is now pointed at Provider Hub. Restart Codex once." });
+    sendJson(res, 200, { ok: true, message: "Codex is pointed at Provider Hub. Provider switches take effect on the next Codex request." });
     return;
   }
   if (req.method === "POST" && req.url === "/api/switch") {
     const body = await readJsonBody(req);
     const config = loadConfig();
-    if (!providerById(config, body.id)) {
+    const provider = providerById(config, body.id);
+    if (!provider) {
       sendJson(res, 404, { ok: false, message: `Provider not found: ${body.id}` });
       return;
     }
-    config.activeProvider = body.id;
-    saveConfig(config);
-    stopAdapter();
-    sendJson(res, 200, { ok: true, message: `Switched to ${body.id}` });
+    const previousProvider = config.activeProvider;
+    try {
+      config.activeProvider = provider.id;
+      saveConfig(config);
+      await prepareProviderForSwitch(provider);
+      if (provider.type === "responses") stopAdapter();
+    } catch (error) {
+      const rollback = loadConfig();
+      if (rollback.activeProvider === provider.id) {
+        rollback.activeProvider = previousProvider;
+        saveConfig(rollback);
+      }
+      throw error;
+    }
+    sendJson(res, 200, { ok: true, message: `Switched to ${provider.id}. Next Codex request will use ${provider.displayName || provider.id}.` });
     return;
   }
   if (req.method === "POST" && req.url === "/api/providers") {
@@ -1034,9 +1063,9 @@ function html() {
         <dt>Codex 配置</dt><dd id="installed">-</dd>
         <dt>Adapter</dt><dd id="adapter">-</dd>
       </dl>
-      <div class="row"><button id="install">安装到 Codex</button><button class="secondary" id="testActive">测试当前厂商</button><button class="light" id="refresh">刷新</button></div>
+      <div class="row"><button id="install">重新同步 Codex 配置</button><button class="secondary" id="testActive">测试当前厂商</button><button class="light" id="refresh">刷新</button></div>
       <div class="row"><button class="light" id="uninstall" style="color:#b45309;border-color:#f0cf9d;">恢复官方配置</button></div>
-      <div class="notice">第一次安装后需要重启 Codex。之后切换厂商通常不需要重启 Codex。</div>
+      <div class="notice">启动 Hub 后会自动同步 Codex 到固定本地入口。之后只需在这里点厂商卡片，下一次 Codex 请求立即使用新厂商。</div>
     </div>
     <div class="panel">
       <h2>联网搜索</h2>
@@ -1203,6 +1232,7 @@ process.on("SIGINT", () => { stopAdapter(); removeHubPid(); process.exit(0); });
 process.on("SIGTERM", () => { stopAdapter(); removeHubPid(); process.exit(0); });
 
 loadConfig();
+ensureCodexConfigInstalled();
 writeHubPid();
 apiServer.listen(API_PORT, API_HOST, () => {
   console.log(`Codex Provider Hub API: http://${API_HOST}:${API_PORT}/v1`);

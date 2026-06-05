@@ -2,7 +2,7 @@
 
 [English](./README.md) | 中文
 
-Codex Switcher 是一个本地厂商管理中心，为 Codex Desktop 提供统一入口。只需配置一次 Codex，之后通过浏览器面板即可在 MiMo、FuseCode、OpenAI 兼容厂商和其他自定义厂商之间自由切换。
+Codex Switcher 是一个本地厂商管理中心，为 Codex Desktop 提供统一入口。启动 Hub 后即可通过浏览器面板在 MiMo、FuseCode、OpenAI 兼容厂商和其他自定义厂商之间自由切换。
 
 ## 解决什么问题
 
@@ -20,7 +20,7 @@ Codex Desktop
       -> 自定义 Responses API 厂商
 ```
 
-安装一次 Hub，重启一次 Codex，之后切换厂商只需在 Hub 面板点击，无需再碰配置文件。
+启动 Hub 后，它会自动把 Codex 指向固定本地入口。之后切换厂商只需在 Hub 面板点击，下一次 Codex 请求立即使用新厂商，无需再碰配置文件。
 
 ## 功能特性
 
@@ -85,22 +85,18 @@ codex-provider-hub/open-windows.cmd
 2. 在后台启动 Hub 服务
 3. 打开控制面板 `http://127.0.0.1:8790`
 
-## 首次配置
+## 使用方式
 
-1. 使用上面的启动脚本运行 Hub
-2. 打开控制面板：
-
-   ```text
-   http://127.0.0.1:8790
-   ```
-
-3. 点击 **安装到 Codex** 按钮
-4. 完全退出并重新打开 Codex Desktop
-
-完成后，Codex 将始终通过以下地址访问模型：
+使用上面的启动脚本运行 Hub。Hub 会自动维护 Codex 配置，让 Codex 始终通过以下固定入口访问模型：
 
 ```text
 http://127.0.0.1:8789/v1
+```
+
+需要切换厂商时打开控制面板：
+
+```text
+http://127.0.0.1:8790
 ```
 
 ## 切换厂商
