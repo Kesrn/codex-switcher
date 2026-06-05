@@ -1153,22 +1153,23 @@ function compactSample(text, limit = 120) {
 }
 
 async function handleApi(req, res) {
-  if (req.method === "GET" && req.url === "/api/status") {
+  const pathname = new URL(req.url || "/", `http://${API_HOST}:${UI_PORT}`).pathname;
+  if (req.method === "GET" && pathname === "/api/status") {
     sendJson(res, 200, await statusPayload());
     return;
   }
-  if (req.method === "GET" && req.url.startsWith("/api/logs")) {
+  if (req.method === "GET" && pathname === "/api/logs") {
     const url = new URL(req.url, `http://${API_HOST}:${UI_PORT}`);
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 120)));
     sendJson(res, 200, { ok: true, lines: readRecentLogLines(limit) });
     return;
   }
-  if (req.method === "GET" && req.url === "/api/gateway-settings") {
+  if (req.method === "GET" && pathname === "/api/gateway-settings") {
     const config = loadConfig();
     sendJson(res, 200, { ok: true, gateway: config.gateway });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/gateway-settings") {
+  if (req.method === "POST" && pathname === "/api/gateway-settings") {
     const body = await readJsonBody(req);
     const config = loadConfig();
     config.gateway = normalizeGatewaySettings({ ...config.gateway, ...body });
@@ -1176,7 +1177,7 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, gateway: config.gateway, message: "高级参数已保存。部分监听端口类参数需要重启 Hub 后生效。" });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/gateway-toggle") {
+  if (req.method === "POST" && pathname === "/api/gateway-toggle") {
     const body = await readJsonBody(req);
     if (body.enabled === false) {
       const backupPath = disableProxyMode();
@@ -1192,7 +1193,7 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, enabled: true, message: "代理已启动：Codex 将通过本地代理使用当前厂商。" });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/switch") {
+  if (req.method === "POST" && pathname === "/api/switch") {
     const body = await readJsonBody(req);
     const config = loadConfig();
     const provider = providerById(config, body.id);
@@ -1217,7 +1218,7 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, message: `Switched to ${provider.id}. Next Codex request will use ${provider.displayName || provider.id}.` });
     return;
   }
-  if (req.method === "GET" && req.url.startsWith("/api/provider-key")) {
+  if (req.method === "GET" && pathname === "/api/provider-key") {
     const url = new URL(req.url, `http://${API_HOST}:${UI_PORT}`);
     const id = String(url.searchParams.get("id") || "").trim();
     const config = loadConfig();
@@ -1229,7 +1230,7 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, id, apiKey: providerKey(provider) });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/providers") {
+  if (req.method === "POST" && pathname === "/api/providers") {
     const body = await readJsonBody(req);
     const config = loadConfig();
     const id = String(body.id || "").trim();
@@ -1274,7 +1275,7 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, provider: redactedProvider(provider) });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/local-search") {
+  if (req.method === "POST" && pathname === "/api/local-search") {
     const body = await readJsonBody(req);
     const config = loadConfig();
     config.localSearch = {
@@ -1286,7 +1287,7 @@ async function handleApi(req, res) {
     sendJson(res, 200, { ok: true, localSearch: config.localSearch });
     return;
   }
-  if (req.method === "POST" && req.url === "/api/test-active") {
+  if (req.method === "POST" && pathname === "/api/test-active") {
     try {
       requireConfiguredProvider(loadConfig());
     } catch (error) {
@@ -1509,11 +1510,12 @@ const apiServer = http.createServer(async (req, res) => {
   try {
     if (!requireAuth(req, res)) return;
     const config = loadConfig();
-    if (req.method === "GET" && req.url === "/v1/models") {
+    const pathname = new URL(req.url || "/", `http://${API_HOST}:${API_PORT}`).pathname;
+    if (req.method === "GET" && pathname === "/v1/models") {
       sendJson(res, 200, modelsResponse(config));
       return;
     }
-    if (req.url.startsWith("/v1/responses")) {
+    if (pathname === "/v1/responses") {
       await handleResponses(req, res);
       return;
     }
@@ -1526,7 +1528,8 @@ const apiServer = http.createServer(async (req, res) => {
 
 const uiServer = http.createServer(async (req, res) => {
   try {
-    if (req.method === "GET" && req.url === "/") {
+    const pathname = new URL(req.url || "/", `http://${API_HOST}:${UI_PORT}`).pathname;
+    if (req.method === "GET" && pathname === "/") {
       res.writeHead(200, securityHeaders({
         "content-type": "text/html; charset=utf-8",
         "content-security-policy": "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
@@ -1534,7 +1537,7 @@ const uiServer = http.createServer(async (req, res) => {
       res.end(html());
       return;
     }
-    if (req.url.startsWith("/api/")) {
+    if (pathname.startsWith("/api/")) {
       if (!requireUiApiAccess(req, res)) return;
       await handleApi(req, res);
       return;
