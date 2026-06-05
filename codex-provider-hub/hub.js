@@ -53,6 +53,7 @@ const CONFIG_PATH = path.join(DATA_DIR, "providers.json");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
 const AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token");
 const LOG_PATH = path.join(DATA_DIR, "hub.log");
+const STATS_PATH = path.join(DATA_DIR, "usage-stats.json");
 const ADAPTER_DATA_DIR = path.join(DATA_DIR, "mimo2codex");
 const ADAPTER_AUTH_TOKEN_PATH = path.join(ADAPTER_DATA_DIR, "hub-api-token");
 const CODEX_DIR = path.join(os.homedir(), ".codex");
@@ -617,11 +618,69 @@ function buildUrl(baseUrl, suffix) {
   return `${baseUrl.replace(/\/+$/, "")}${suffix}`;
 }
 
-function proxyHttp(url, req, res, body, headers = {}) {
+function emptyUsageStats() {
+  return {
+    totalRequests: 0,
+    totalErrors: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalTokens: 0,
+    byProvider: {},
+    byModel: {},
+    recent: []
+  };
+}
+
+function loadUsageStats() {
+  return { ...emptyUsageStats(), ...readJson(STATS_PATH, emptyUsageStats()) };
+}
+
+function extractUsage(payload) {
+  const usage = payload?.usage || {};
+  const inputTokens = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0) || 0;
+  const outputTokens = Number(usage.output_tokens ?? usage.completion_tokens ?? 0) || 0;
+  const totalTokens = Number(usage.total_tokens ?? (inputTokens + outputTokens)) || 0;
+  return { inputTokens, outputTokens, totalTokens };
+}
+
+function incrementUsageBucket(bucket, key, usage, ok) {
+  const id = key || "unknown";
+  bucket[id] ||= { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  bucket[id].requests += 1;
+  if (!ok) bucket[id].errors += 1;
+  bucket[id].inputTokens += usage.inputTokens;
+  bucket[id].outputTokens += usage.outputTokens;
+  bucket[id].totalTokens += usage.totalTokens;
+}
+
+function recordUsage({ provider, model, statusCode, latencyMs, payload }) {
+  const stats = loadUsageStats();
+  const ok = statusCode >= 200 && statusCode < 400;
+  const usage = extractUsage(payload);
+  stats.totalRequests += 1;
+  if (!ok) stats.totalErrors += 1;
+  stats.totalInputTokens += usage.inputTokens;
+  stats.totalOutputTokens += usage.outputTokens;
+  stats.totalTokens += usage.totalTokens;
+  incrementUsageBucket(stats.byProvider, provider?.id, usage, ok);
+  incrementUsageBucket(stats.byModel, model || provider?.model, usage, ok);
+  stats.recent = [{
+    at: new Date().toISOString(),
+    provider: provider?.id || "unknown",
+    model: model || provider?.model || "unknown",
+    statusCode,
+    latencyMs,
+    ...usage
+  }, ...(Array.isArray(stats.recent) ? stats.recent : [])].slice(0, 100);
+  writeJson(STATS_PATH, stats);
+}
+
+function proxyHttp(url, req, res, body, headers = {}, meta = {}) {
   const target = new URL(url);
   if (!["http:", "https:"].includes(target.protocol)) {
     throw new Error(`Unsupported upstream protocol: ${target.protocol}`);
   }
+  const started = Date.now();
   const transport = target.protocol === "https:" ? https : http;
   const outgoingHeaders = {
     "content-type": req.headers["content-type"] || "application/json",
@@ -637,10 +696,30 @@ function proxyHttp(url, req, res, body, headers = {}) {
     path: `${target.pathname}${target.search}`,
     headers: outgoingHeaders
   }, (upstreamRes) => {
-    res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-    upstreamRes.pipe(res);
+    const statusCode = upstreamRes.statusCode || 502;
+    const contentType = String(upstreamRes.headers["content-type"] || "");
+    const shouldCapture = !contentType.includes("text/event-stream");
+    if (!shouldCapture) {
+      recordUsage({ ...meta, statusCode, latencyMs: Date.now() - started, payload: null });
+      res.writeHead(statusCode, upstreamRes.headers);
+      upstreamRes.pipe(res);
+      return;
+    }
+    const chunks = [];
+    upstreamRes.on("data", (chunk) => chunks.push(chunk));
+    upstreamRes.on("end", () => {
+      const responseBody = Buffer.concat(chunks);
+      let payload = null;
+      try { payload = JSON.parse(responseBody.toString("utf8")); } catch {}
+      recordUsage({ ...meta, statusCode, latencyMs: Date.now() - started, payload });
+      res.writeHead(statusCode, upstreamRes.headers);
+      res.end(responseBody);
+    });
   });
-  upstream.on("error", (error) => sendJson(res, 502, { error: { type: "provider_hub_error", message: error.message } }));
+  upstream.on("error", (error) => {
+    recordUsage({ ...meta, statusCode: 502, latencyMs: Date.now() - started, payload: null });
+    sendJson(res, 502, { error: { type: "provider_hub_error", message: error.message } });
+  });
   upstream.end(body);
 }
 
@@ -813,14 +892,14 @@ async function handleResponses(req, res) {
     }
     proxyHttp(buildUrl(provider.baseUrl, "/v1/responses"), req, res, JSON.stringify(payload), {
       authorization: `Bearer ${key}`
-    });
+    }, { provider, model: payload.model });
     return;
   }
 
   await ensureAdapter(provider);
   proxyHttp(`http://${API_HOST}:${ADAPTER_PORT}/v1/responses`, req, res, JSON.stringify(payload), {
     authorization: `Bearer ${adapter.authToken}`
-  });
+  }, { provider, model: payload.model });
 }
 
 function installCodexConfig() {
@@ -941,6 +1020,7 @@ async function statusPayload() {
     providers: config.providers.map(redactedProvider),
     localSearch: config.localSearch,
     gateway: config.gateway,
+    usageStats: loadUsageStats(),
     adapterPort: ADAPTER_PORT
   };
 }
@@ -1109,7 +1189,7 @@ function html() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Codex Switcher</title>
 <style>
-*,*::before,*::after{box-sizing:border-box}body{margin:0;min-height:100vh;font:13px/1.45 "Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:#1f2328;background:#6e6e6e;display:grid;place-items:center;padding:18px}button,input,select{font:inherit}.window{width:min(1240px,calc(100vw - 24px));height:min(780px,calc(100vh - 24px));background:#f3f4f6;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.34),0 0 0 1px rgba(0,0,0,.14);display:flex;flex-direction:column}.titlebar{height:34px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 16px;user-select:none}.title-left{display:flex;align-items:center;gap:9px;color:#6b7280;font-size:12px}.app-icon{width:16px;height:16px;border-radius:4px;background:#2563eb;display:grid;place-items:center;color:white;font-weight:800;font-size:11px}.traffic{display:flex}.traffic button{width:42px;height:32px;border:0;background:transparent;color:#6b7280}.traffic button:hover{background:#f3f4f6}.traffic .close:hover{background:#dc2626;color:white}.shell{flex:1;min-height:0;display:flex}.sidebar{width:230px;background:#fff;border-right:1px solid #e5e7eb;display:flex;flex-direction:column}.brand{padding:18px 16px 10px}.brand h1{font-size:16px;line-height:1.1;margin:0;color:#111827;letter-spacing:-.02em}.brand p{margin:3px 0 0;color:#6b7280;font-size:11px}.status-pill{margin-top:12px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:700}.status-pill.ok{background:#ecfdf5;color:#15803d}.status-pill.warn{background:#fff7ed;color:#c2410c}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}.nav-label{padding:14px 16px 5px;color:#8b949e;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.07em}.nav{padding:0 8px}.nav button{width:100%;height:36px;border:0;border-radius:7px;background:transparent;color:#6b7280;display:flex;align-items:center;gap:10px;padding:0 10px;text-align:left;cursor:pointer}.nav button:hover{background:#f3f4f6;color:#111827}.nav button.active{background:#eaf1ff;color:#2563eb;font-weight:700}.sidebar-footer{margin-top:auto;padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:11px}.content{flex:1;min-width:0;display:flex;flex-direction:column}.page{display:none;min-height:0;flex:1;flex-direction:column}.page.active{display:flex}.page-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:20px 24px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.page-title{font-size:19px;font-weight:800;letter-spacing:-.025em;color:#111827}.page-sub{margin-top:3px;color:#6b7280;font-size:12px}.page-body{padding:20px 24px;overflow:auto}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:7px;min-height:34px;padding:0 13px;display:inline-flex;align-items:center;gap:7px;font-weight:750;cursor:pointer}.btn-primary{background:#2563eb;color:white}.btn-primary:hover{background:#1d4ed8}.btn-secondary{background:#fff;color:#111827;border:1px solid #d1d5db}.btn-secondary:hover{background:#f9fafb}.btn-danger{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.btn-success{background:#ecfdf5;color:#15803d;border:1px solid #bbf7d0}.btn:disabled{opacity:.55;cursor:not-allowed}.grid{display:grid;gap:14px}.stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px}.stat-label{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.stat-value{font-size:26px;font-weight:850;letter-spacing:-.03em;margin-top:4px;color:#111827}.stat-note{font-size:11px;color:#6b7280;margin-top:4px}.hero{display:flex;justify-content:space-between;gap:24px;align-items:center;background:linear-gradient(135deg,#fff,#f8fbff);border:1px solid #dbeafe;border-radius:12px;padding:18px 20px;margin-bottom:18px}.hero h2{font-size:17px;margin:0;color:#111827}.hero p{margin:4px 0 0;color:#6b7280}.meta{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}.meta div{font-size:12px;color:#6b7280}.meta code,.code{font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:11px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;padding:2px 6px;color:#111827}.providers{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.provider{position:relative;background:#fff;border:1px solid #e5e7eb;border-radius:11px;padding:15px;transition:.14s}.provider:hover{border-color:#bfdbfe;box-shadow:0 8px 24px rgba(37,99,235,.08)}.provider.active{border-color:#60a5fa;background:#f8fbff}.provider h3{margin:0;font-size:15px;color:#111827}.provider .type{margin-top:7px;color:#6b7280;font-size:12px;display:flex;gap:6px;flex-wrap:wrap}.provider .row{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:750}.badge-ok{background:#ecfdf5;color:#15803d}.badge-warn{background:#fff7ed;color:#c2410c}.badge-blue{background:#eaf1ff;color:#2563eb}.badge-muted{background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb}.split{grid-template-columns:1fr 360px;align-items:start}.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.form label{display:grid;gap:5px;color:#6b7280;font-size:12px}.form .full{grid-column:1/-1}.input,select{height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 10px}.input:focus,select:focus{outline:2px solid #bfdbfe;border-color:#60a5fa}.logbox{height:430px;overflow:auto;background:#0b1220;color:#dbeafe;border-radius:10px;border:1px solid #111827;padding:13px;font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:12px;line-height:1.6}.logbox div{white-space:pre-wrap;border-bottom:1px solid rgba(255,255,255,.06);padding:3px 0}.notice{border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;border-radius:9px;padding:12px;font-size:12px}.toast{position:fixed;right:28px;bottom:28px;max-width:460px;background:#111827;color:#fff;border-radius:10px;padding:12px 14px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:none;z-index:10}.toast.show{display:block}@media(max-width:900px){body{padding:0}.window{width:100vw;height:100vh;border-radius:0}.sidebar{width:200px}.stats,.split{grid-template-columns:1fr}.form{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.page-header{flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}}
+*,*::before,*::after{box-sizing:border-box}body{margin:0;min-height:100vh;font:13px/1.45 "Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:#1f2328;background:#6e6e6e;display:grid;place-items:center;padding:18px}button,input,select{font:inherit;max-width:100%}.window{width:min(1240px,calc(100vw - 24px));height:min(780px,calc(100vh - 24px));background:#f3f4f6;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.34),0 0 0 1px rgba(0,0,0,.14);display:flex;flex-direction:column}.titlebar{height:34px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 16px;user-select:none}.title-left{display:flex;align-items:center;gap:9px;color:#6b7280;font-size:12px}.app-icon{width:16px;height:16px;border-radius:4px;background:#2563eb;display:grid;place-items:center;color:white;font-weight:800;font-size:11px}.traffic{display:flex}.traffic button{width:42px;height:32px;border:0;background:transparent;color:#6b7280}.traffic button:hover{background:#f3f4f6}.traffic .close:hover{background:#dc2626;color:white}.shell{flex:1;min-height:0;display:flex}.sidebar{width:230px;background:#fff;border-right:1px solid #e5e7eb;display:flex;flex-direction:column}.brand{padding:18px 16px 10px}.brand h1{font-size:16px;line-height:1.1;margin:0;color:#111827;letter-spacing:-.02em}.brand p{margin:3px 0 0;color:#6b7280;font-size:11px}.status-pill{margin-top:12px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:700}.status-pill.ok{background:#ecfdf5;color:#15803d}.status-pill.warn{background:#fff7ed;color:#c2410c}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}.nav-label{padding:14px 16px 5px;color:#8b949e;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.07em}.nav{padding:0 8px}.nav button{width:100%;height:36px;border:0;border-radius:7px;background:transparent;color:#6b7280;display:flex;align-items:center;gap:10px;padding:0 10px;text-align:left;cursor:pointer}.nav button:hover{background:#f3f4f6;color:#111827}.nav button.active{background:#eaf1ff;color:#2563eb;font-weight:700}.sidebar-footer{margin-top:auto;padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:11px}.content{flex:1;min-width:0;display:flex;flex-direction:column}.page{display:none;min-height:0;flex:1;flex-direction:column}.page.active{display:flex}.page-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:20px 24px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.page-title{font-size:19px;font-weight:800;letter-spacing:-.025em;color:#111827}.page-sub{margin-top:3px;color:#6b7280;font-size:12px}.page-body{padding:20px 24px;overflow:auto;overflow-x:hidden}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:7px;min-height:34px;padding:0 13px;display:inline-flex;align-items:center;gap:7px;font-weight:750;cursor:pointer}.btn-primary{background:#2563eb;color:white}.btn-primary:hover{background:#1d4ed8}.btn-secondary{background:#fff;color:#111827;border:1px solid #d1d5db}.btn-secondary:hover{background:#f9fafb}.btn-danger{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.btn-success{background:#ecfdf5;color:#15803d;border:1px solid #bbf7d0}.btn:disabled{opacity:.55;cursor:not-allowed}.grid{display:grid;gap:14px}.stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px;min-width:0;overflow:hidden}.stat-label{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.stat-value{font-size:26px;font-weight:850;letter-spacing:-.03em;margin-top:4px;color:#111827}.stat-note{font-size:11px;color:#6b7280;margin-top:4px}.hero{display:flex;justify-content:space-between;gap:24px;align-items:center;background:linear-gradient(135deg,#fff,#f8fbff);border:1px solid #dbeafe;border-radius:12px;padding:18px 20px;margin-bottom:18px}.hero h2{font-size:17px;margin:0;color:#111827}.hero p{margin:4px 0 0;color:#6b7280}.meta{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}.meta div{font-size:12px;color:#6b7280}.meta code,.code{font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:11px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;padding:2px 6px;color:#111827}.providers{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.provider{position:relative;background:#fff;border:1px solid #e5e7eb;border-radius:11px;padding:15px;transition:.14s}.provider:hover{border-color:#bfdbfe;box-shadow:0 8px 24px rgba(37,99,235,.08)}.provider.active{border-color:#60a5fa;background:#f8fbff}.provider h3{margin:0;font-size:15px;color:#111827}.provider .type{margin-top:7px;color:#6b7280;font-size:12px;display:flex;gap:6px;flex-wrap:wrap}.provider .row{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:750}.badge-ok{background:#ecfdf5;color:#15803d}.badge-warn{background:#fff7ed;color:#c2410c}.badge-blue{background:#eaf1ff;color:#2563eb}.badge-muted{background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb}.split{grid-template-columns:minmax(0,1fr) minmax(320px,360px);align-items:start}.form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;min-width:0}.form label{display:grid;gap:5px;color:#6b7280;font-size:12px;min-width:0}.form .full{grid-column:1/-1}.input,select{width:100%;min-width:0;height:38px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#111827;padding:0 10px}.input:focus,select:focus{outline:2px solid #bfdbfe;border-color:#60a5fa}.logbox{height:430px;overflow:auto;background:#0b1220;color:#dbeafe;border-radius:10px;border:1px solid #111827;padding:13px;font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:12px;line-height:1.6}.logbox div{white-space:pre-wrap;border-bottom:1px solid rgba(255,255,255,.06);padding:3px 0}.notice{border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;border-radius:9px;padding:12px;font-size:12px}.toast{position:fixed;right:28px;bottom:28px;max-width:460px;background:#111827;color:#fff;border-radius:10px;padding:12px 14px;box-shadow:0 16px 40px rgba(0,0,0,.28);display:none;z-index:10}.toast.show{display:block}@media(max-width:1100px){body{padding:0}.window{width:100vw;height:100vh;border-radius:0}.sidebar{width:200px}.stats,.split{grid-template-columns:1fr}.form{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.page-header{flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.shell{flex-direction:column}.sidebar{width:100%;border-right:0;border-bottom:1px solid #e5e7eb;max-height:190px}.brand{padding:12px 14px 6px}.nav-label{display:none}.nav{display:flex;gap:6px;overflow:auto;padding:6px 8px}.nav button{min-width:max-content;width:auto}.sidebar-footer{display:none}.page-header{padding:14px 16px}.page-body{padding:14px 16px}.stats{grid-template-columns:1fr}.providers{grid-template-columns:1fr}.traffic{display:none}}
 </style>
 </head>
 <body>
@@ -1132,8 +1212,8 @@ function html() {
         <header class="page-header"><div><div class="page-title">运行概览</div><div class="page-sub">Codex 固定连接 Hub，厂商切换在下一次请求生效。</div></div><div class="actions"><button id="testActive" class="btn btn-primary">测试当前厂商</button><button id="syncCodex" class="btn btn-secondary">同步 Codex 配置</button></div></header>
         <div class="page-body">
           <div class="hero"><div><h2 id="activeTitle">当前厂商</h2><p id="activeSub">读取中...</p><div class="meta"><div>API <code id="apiUrl">-</code></div><div>数据目录 <code id="dataDir">-</code></div><div>Adapter <code id="adapterState">-</code></div></div></div><span id="activeBadge" class="badge badge-blue">Current</span></div>
-          <div class="grid stats"><div class="card"><div class="stat-label">厂商数量</div><div id="providerCount" class="stat-value">-</div><div class="stat-note">已配置 providers</div></div><div class="card"><div class="stat-label">Codex 配置</div><div id="codexState" class="stat-value">-</div><div class="stat-note">启动时自动同步</div></div><div class="card"><div class="stat-label">本地搜索</div><div id="searchState" class="stat-value">-</div><div class="stat-note" id="searchNote">DuckDuckGo 注入</div></div><div class="card"><div class="stat-label">密钥状态</div><div id="keyState" class="stat-value">-</div><div class="stat-note">缺失时不可切换</div></div></div>
-          <div class="grid split"><div class="card"><h3 style="margin:0 0 12px">快速切换</h3><div id="quickProviders" class="grid providers"></div></div><div class="card"><h3 style="margin:0 0 12px">操作反馈</h3><div id="messagePanel" class="notice">准备就绪。选择厂商后，下次 Codex 请求会使用新厂商。</div></div></div>
+          <div class="grid stats"><div class="card"><div class="stat-label">总请求</div><div id="requestCount" class="stat-value">-</div><div class="stat-note" id="errorRate">错误率 -</div></div><div class="card"><div class="stat-label">Token 消耗</div><div id="tokenTotal" class="stat-value">-</div><div class="stat-note" id="tokenSplit">输入 - / 输出 -</div></div><div class="card"><div class="stat-label">当前模型消耗</div><div id="activeModelTokens" class="stat-value">-</div><div class="stat-note" id="activeModelName">-</div></div><div class="card"><div class="stat-label">密钥状态</div><div id="keyState" class="stat-value">-</div><div class="stat-note">缺失时不可切换</div></div></div>
+          <div class="grid split"><div class="card"><h3 style="margin:0 0 12px">快速切换</h3><div id="quickProviders" class="grid providers"></div></div><div class="card"><h3 style="margin:0 0 12px">模型消耗排行</h3><div id="modelUsage" class="grid"></div></div><div class="card"><h3 style="margin:0 0 12px">操作反馈</h3><div id="messagePanel" class="notice">准备就绪。选择厂商后，下次 Codex 请求会使用新厂商。</div></div></div>
         </div>
       </section>
       <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div class="grid split"><div><div id="providers" class="grid providers"></div></div><div class="card"><h3 id="providerFormTitle" style="margin:0 0 12px">添加自定义厂商</h3><form id="providerForm" class="form"><label>ID<input class="input" name="id" placeholder="deepseek"></label><label>显示名<input class="input" name="displayName" placeholder="DeepSeek"></label><label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option><option value="mimo">MiMo</option></select></label><label>模型<input class="input" name="model" placeholder="deepseek-chat"></label><label class="full">Base URL<input class="input" name="baseUrl" placeholder="https://api.deepseek.com/v1"></label><label class="full">API Key<input class="input" name="apiKey" type="password" placeholder="留空则沿用已保存密钥"></label><button class="btn btn-primary full" id="saveProvider">保存厂商</button></form></div></div></div></section>
@@ -1155,7 +1235,7 @@ async function api(path, opts={}){ const headers={authorization:'Bearer '+AUTH_T
 function nav(page){ document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.nav button[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('page-'+page).classList.add('active'); if(page==='logs') loadLogs(); }
 document.querySelectorAll('.nav button[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));
 function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const active=p.id===lastStatus.activeProvider; el.innerHTML='<h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+'</div><div class="type url"></div><div class="row"></div>'; el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; const sw=document.createElement('button'); sw.className=active?'btn btn-success':'btn btn-primary'; sw.textContent=active?'当前使用':'切换到此厂商'; sw.disabled=active; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
-async function refresh(){ lastStatus=await api('/api/status'); $('sideApi').textContent=lastStatus.apiUrl; $('apiUrl').textContent=lastStatus.apiUrl; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=lastStatus.adapterRunning?'运行中':'按需启动'; $('activeTitle').textContent=lastStatus.activeProviderDisplayName||lastStatus.activeProvider; $('activeSub').textContent='当前 ID：'+lastStatus.activeProvider+' · 下一次 Codex 请求生效'; $('providerCount').textContent=lastStatus.providers.length; $('codexState').textContent=lastStatus.codexInstalled?'已接入':'未接入'; $('searchState').textContent=lastStatus.localSearch?.enabled?'开启':'关闭'; $('searchNote').textContent=lastStatus.localSearch?.onlyWhenLikelyNeeded?'只在需要时触发':'每次 web_search 触发'; const missing=lastStatus.providers.filter(p=>!p.hasKey).length; $('keyState').textContent=missing===0?'完整':missing+' 缺失'; $('sideStatus').className='status-pill '+(lastStatus.codexInstalled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=lastStatus.codexInstalled?'Hub 运行中':'待同步'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; lastStatus.providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); fillGatewaySettings(lastStatus.gateway||{}); }
+async function refresh(){ lastStatus=await api('/api/status'); $('sideApi').textContent=lastStatus.apiUrl; $('apiUrl').textContent=lastStatus.apiUrl; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=lastStatus.adapterRunning?'运行中':'按需启动'; $('activeTitle').textContent=lastStatus.activeProviderDisplayName||lastStatus.activeProvider; $('activeSub').textContent='当前 ID：'+lastStatus.activeProvider+' · 下一次 Codex 请求生效'; updateUsageStats(lastStatus.usageStats||{}); const missing=lastStatus.providers.filter(p=>!p.hasKey).length; $('keyState').textContent=missing===0?'完整':missing+' 缺失'; $('sideStatus').className='status-pill '+(lastStatus.codexInstalled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=lastStatus.codexInstalled?'Hub 运行中':'待同步'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; lastStatus.providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); fillGatewaySettings(lastStatus.gateway||{}); }
 function fillProviderForm(p){ const f=$('providerForm'); f.elements.id.value=p.id||''; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.elements.apiKey.value=''; $('providerFormTitle').textContent='编辑已保存厂商'; $('saveProvider').textContent='保存修改'; nav('providers'); toast((p.displayName||p.id)+' 已载入表单，API Key 留空会沿用已保存密钥。'); }
 function resetProviderForm(){ const f=$('providerForm'); f.reset(); $('providerFormTitle').textContent='添加自定义厂商'; $('saveProvider').textContent='保存厂商'; }
 async function loadLogs(){ try{ const r=await api('/api/logs?limit=160'); $('logs').innerHTML=(r.lines.length?r.lines:['暂无日志']).map(line=>'<div></div>').join(''); [...$('logs').children].forEach((el,i)=>el.textContent=r.lines[i]||'暂无日志'); }catch(e){ $('logs').textContent=e.message; } }
@@ -1163,6 +1243,8 @@ function routeRow(route={}){ const el=document.createElement('div'); el.classNam
 function modelRow(mapping={}){ const el=document.createElement('div'); el.className='form'; el.innerHTML='<label>Codex 模型名称<input class="input" name="input" placeholder="current"></label><label>输出模型名称<input class="input" name="output" placeholder="provider.model"></label><label style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="enabled" type="checkbox" style="width:auto">启用</label><button type="button" class="btn btn-danger">删除</button>'; el.elements=Object.fromEntries([...el.querySelectorAll('[name]')].map(x=>[x.name,x])); el.elements.input.value=mapping.input||''; el.elements.output.value=mapping.output||''; el.elements.enabled.checked=mapping.enabled!==false; el.querySelector('button').onclick=()=>el.remove(); return el; }
 function fillGatewaySettings(g={}){ const f=$('gatewayForm'); if(!f) return; for(const [k,v] of Object.entries(g)){ if(!f.elements[k]) continue; if(f.elements[k].type==='checkbox') f.elements[k].checked=!!v; else f.elements[k].value=v; } $('routeRows').innerHTML=''; (g.routes||[]).forEach(r=>$('routeRows').append(routeRow(r))); $('modelRows').innerHTML=''; (g.modelMappings||[]).forEach(m=>$('modelRows').append(modelRow(m))); }
 function collectGatewaySettings(){ const f=$('gatewayForm'); const data=Object.fromEntries(new FormData(f).entries()); ['listenPort','uiPort','connectTimeoutMs','readTimeoutMs','maxRetries','maxRequestsPerMinute','maxConcurrentConnections'].forEach(k=>data[k]=Number(data[k])); data.logRequestBody=!!f.elements.logRequestBody.checked; data.routes=[...$('routeRows').children].map(row=>({inbound:row.elements.inbound.value,mode:row.elements.mode.value,outbound:row.elements.outbound.value,enabled:row.elements.enabled.checked})); data.modelMappings=[...$('modelRows').children].map(row=>({input:row.elements.input.value,output:row.elements.output.value,enabled:row.elements.enabled.checked})); return data; }
+function fmt(n){ n=Number(n)||0; if(n>=1000000) return (n/1000000).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(1)+'K'; return String(n); }
+function updateUsageStats(stats={}){ const requests=stats.totalRequests||0; const errors=stats.totalErrors||0; $('requestCount').textContent=fmt(requests); $('errorRate').textContent='错误率 '+(requests?((errors/requests)*100).toFixed(1):'0.0')+'%'; $('tokenTotal').textContent=fmt(stats.totalTokens); $('tokenSplit').textContent='输入 '+fmt(stats.totalInputTokens)+' / 输出 '+fmt(stats.totalOutputTokens); const byModel=stats.byModel||{}; const activeModel=lastStatus?.providers?.find?.(p=>p.id===lastStatus.activeProvider)?.model || lastStatus?.activeProvider; const active=byModel[activeModel]||{}; $('activeModelTokens').textContent=fmt(active.totalTokens); $('activeModelName').textContent=activeModel||'-'; const rows=Object.entries(byModel).sort((a,b)=>(b[1].totalTokens||0)-(a[1].totalTokens||0)).slice(0,6); $('modelUsage').innerHTML=rows.length?'':'<div class="notice">暂无模型消耗数据，发起请求后会自动统计。</div>'; rows.forEach(([model,item])=>{ const el=document.createElement('div'); el.className='notice'; el.innerHTML='<div style="display:flex;justify-content:space-between;gap:10px"><span class="code"></span><strong></strong></div><div style="font-size:12px;color:#6b7280;margin-top:4px"></div>'; el.querySelector('.code').textContent=model; el.querySelector('strong').textContent=fmt(item.totalTokens||0)+' tokens'; el.lastElementChild.textContent=(item.requests||0)+' 请求 · 输入 '+fmt(item.inputTokens||0)+' / 输出 '+fmt(item.outputTokens||0); $('modelUsage').append(el); }); }
 $('refreshAll').onclick=()=>refresh().then(()=>toast('状态已刷新')).catch(e=>toast(e.message));
 $('openApi').onclick=()=>navigator.clipboard?.writeText(lastStatus?.apiUrl||'').then(()=>toast('API 地址已复制'));
 $('syncCodex').onclick=async()=>{ try{ const r=await api('/api/install-codex',{method:'POST'}); toast(r.message); await refresh(); }catch(e){ toast(e.message); } };
