@@ -204,6 +204,31 @@ function defaultConfig() {
       provider: "duckduckgo",
       onlyWhenLikelyNeeded: true
     },
+    gateway: {
+      listenHost: API_HOST,
+      listenPort: API_PORT,
+      uiPort: UI_PORT,
+      upstreamBaseUrl: "https://api.deepseek.com",
+      tlsCertPath: "",
+      connectTimeoutMs: 5000,
+      readTimeoutMs: 30000,
+      maxRetries: 3,
+      retryBackoff: "exponential",
+      keyStrategy: "round-robin",
+      logLevel: "INFO",
+      logFilePath: LOG_PATH,
+      logRequestBody: false,
+      maxRequestsPerMinute: 120,
+      maxConcurrentConnections: 20,
+      routes: [
+        { inbound: "POST /v1/responses", mode: "protocol-convert", outbound: "POST /v1/responses", enabled: true },
+        { inbound: "GET /v1/models", mode: "passthrough", outbound: "GET /v1/models", enabled: true }
+      ],
+      modelMappings: [
+        { input: "current", output: "<active provider model>", enabled: true },
+        { input: "provider id", output: "provider.model", enabled: true }
+      ]
+    },
     providers: [
       {
         id: "mimo",
@@ -227,11 +252,56 @@ function defaultConfig() {
   };
 }
 
+
+function numberInRange(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function normalizeGatewaySettings(settings = {}) {
+  const defaults = defaultConfig().gateway;
+  const retryBackoffs = new Set(["exponential", "fixed", "linear"]);
+  const keyStrategies = new Set(["round-robin", "least-load", "primary-first"]);
+  const logLevels = new Set(["DEBUG", "INFO", "WARN", "ERROR"]);
+  return {
+    ...defaults,
+    ...settings,
+    listenHost: String(settings.listenHost || defaults.listenHost),
+    listenPort: numberInRange(settings.listenPort, defaults.listenPort, 1, 65535),
+    uiPort: numberInRange(settings.uiPort, defaults.uiPort, 1, 65535),
+    upstreamBaseUrl: String(settings.upstreamBaseUrl || defaults.upstreamBaseUrl),
+    tlsCertPath: String(settings.tlsCertPath || ""),
+    connectTimeoutMs: numberInRange(settings.connectTimeoutMs, defaults.connectTimeoutMs, 100, 120000),
+    readTimeoutMs: numberInRange(settings.readTimeoutMs, defaults.readTimeoutMs, 1000, 600000),
+    maxRetries: numberInRange(settings.maxRetries, defaults.maxRetries, 0, 10),
+    retryBackoff: retryBackoffs.has(settings.retryBackoff) ? settings.retryBackoff : defaults.retryBackoff,
+    keyStrategy: keyStrategies.has(settings.keyStrategy) ? settings.keyStrategy : defaults.keyStrategy,
+    logLevel: logLevels.has(settings.logLevel) ? settings.logLevel : defaults.logLevel,
+    logFilePath: String(settings.logFilePath || defaults.logFilePath),
+    logRequestBody: settings.logRequestBody === true,
+    maxRequestsPerMinute: numberInRange(settings.maxRequestsPerMinute, defaults.maxRequestsPerMinute, 1, 100000),
+    maxConcurrentConnections: numberInRange(settings.maxConcurrentConnections, defaults.maxConcurrentConnections, 1, 10000),
+    routes: Array.isArray(settings.routes) ? settings.routes.map((route) => ({
+      inbound: String(route.inbound || ""),
+      mode: String(route.mode || "protocol-convert"),
+      outbound: String(route.outbound || ""),
+      enabled: route.enabled !== false
+    })).filter((route) => route.inbound && route.outbound).slice(0, 50) : defaults.routes,
+    modelMappings: Array.isArray(settings.modelMappings) ? settings.modelMappings.map((mapping) => ({
+      input: String(mapping.input || ""),
+      output: String(mapping.output || ""),
+      enabled: mapping.enabled !== false
+    })).filter((mapping) => mapping.input && mapping.output).slice(0, 100) : defaults.modelMappings
+  };
+}
+
 function loadConfig() {
   ensureDir(DATA_DIR);
   if (!fs.existsSync(CONFIG_PATH)) writeJson(CONFIG_PATH, defaultConfig());
   migrateOldKeys();
   const config = readJson(CONFIG_PATH, defaultConfig());
+  config.gateway = normalizeGatewaySettings(config.gateway);
   const oldEnv = readEnvFile(OLD_MIMO_ENV);
   const mimo = providerById(config, "mimo");
   if (mimo && oldEnv.MIMO_BASE_URL && mimo.baseUrl === "https://api.xiaomimimo.com/v1" && oldEnv.MIMO_API_KEY?.startsWith("tp-")) {
@@ -870,6 +940,7 @@ async function statusPayload() {
     adapterRunning: !!(adapter?.process && !adapter.process.killed) && await canConnect(ADAPTER_PORT),
     providers: config.providers.map(redactedProvider),
     localSearch: config.localSearch,
+    gateway: config.gateway,
     adapterPort: ADAPTER_PORT
   };
 }
@@ -896,6 +967,19 @@ async function handleApi(req, res) {
     const url = new URL(req.url, `http://${API_HOST}:${UI_PORT}`);
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 120)));
     sendJson(res, 200, { ok: true, lines: readRecentLogLines(limit) });
+    return;
+  }
+  if (req.method === "GET" && req.url === "/api/gateway-settings") {
+    const config = loadConfig();
+    sendJson(res, 200, { ok: true, gateway: config.gateway });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/gateway-settings") {
+    const body = await readJsonBody(req);
+    const config = loadConfig();
+    config.gateway = normalizeGatewaySettings({ ...config.gateway, ...body });
+    saveConfig(config);
+    sendJson(res, 200, { ok: true, gateway: config.gateway, message: "高级参数已保存。部分监听端口类参数需要重启 Hub 后生效。" });
     return;
   }
   if (req.method === "POST" && req.url === "/api/install-codex") {
@@ -1054,7 +1138,11 @@ function html() {
       </section>
       <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div class="grid split"><div><div id="providers" class="grid providers"></div></div><div class="card"><h3 id="providerFormTitle" style="margin:0 0 12px">添加自定义厂商</h3><form id="providerForm" class="form"><label>ID<input class="input" name="id" placeholder="deepseek"></label><label>显示名<input class="input" name="displayName" placeholder="DeepSeek"></label><label>类型<select name="type"><option value="openai-chat">OpenAI Chat Completions</option><option value="responses">Responses API</option><option value="mimo">MiMo</option></select></label><label>模型<input class="input" name="model" placeholder="deepseek-chat"></label><label class="full">Base URL<input class="input" name="baseUrl" placeholder="https://api.deepseek.com/v1"></label><label class="full">API Key<input class="input" name="apiKey" type="password" placeholder="留空则沿用已保存密钥"></label><button class="btn btn-primary full" id="saveProvider">保存厂商</button></form></div></div></div></section>
       <section id="page-logs" class="page"><header class="page-header"><div><div class="page-title">运行日志</div><div class="page-sub">读取本地 data/hub.log，便于排查切换和适配器状态。</div></div><div class="actions"><button id="refreshLogs" class="btn btn-secondary">刷新日志</button></div></header><div class="page-body"><div id="logs" class="logbox">读取中...</div></div></section>
-      <section id="page-settings" class="page"><header class="page-header"><div><div class="page-title">设置</div><div class="page-sub">管理 Codex 接入、本地搜索和恢复官方配置。</div></div></header><div class="page-body"><div class="grid split"><div class="card"><h3 style="margin:0 0 12px">本地搜索</h3><p style="margin:0 0 12px;color:#6b7280">当提示需要实时信息时，Hub 可本地搜索并注入结果。</p><button id="toggleSearch" class="btn btn-secondary">切换本地搜索</button></div><div class="card"><h3 style="margin:0 0 12px">危险操作</h3><p style="margin:0 0 12px;color:#6b7280">恢复官方 OpenAI 配置会让 Codex 离开 Hub。</p><button id="uninstall" class="btn btn-danger">恢复官方配置</button></div></div></div></section>
+      <section id="page-settings" class="page"><header class="page-header"><div><div class="page-title">设置</div><div class="page-sub">高级网关参数、路由规则、模型映射和本地搜索。</div></div><div class="actions"><button id="saveGatewaySettings" class="btn btn-primary">保存高级参数</button></div></header><div class="page-body"><div class="grid split"><div class="grid">
+        <div class="card"><h3 style="margin:0 0 12px">基础参数</h3><form id="gatewayForm" class="form"><label>监听地址<input class="input" name="listenHost" placeholder="127.0.0.1"></label><label>监听端口<input class="input" name="listenPort" type="number"></label><label>UI 端口<input class="input" name="uiPort" type="number"></label><label>上游 BaseURL<input class="input" name="upstreamBaseUrl" placeholder="https://api.deepseek.com"></label><label class="full">TLS 证书路径（可选）<input class="input" name="tlsCertPath" placeholder="路径或留空"></label><label>连接超时 (ms)<input class="input" name="connectTimeoutMs" type="number"></label><label>读取超时 (ms)<input class="input" name="readTimeoutMs" type="number"></label><label>最大重试次数<input class="input" name="maxRetries" type="number" min="0" max="10"></label><label>重试退避策略<select name="retryBackoff"><option value="exponential">指数退避</option><option value="fixed">固定间隔</option><option value="linear">线性增长</option></select></label><label>Key 调度策略<select name="keyStrategy"><option value="round-robin">轮询 Round Robin</option><option value="least-load">最低负载优先</option><option value="primary-first">固定首选</option></select></label><label>日志级别<select name="logLevel"><option>INFO</option><option>DEBUG</option><option>WARN</option><option>ERROR</option></select></label><label class="full">日志文件路径<input class="input" name="logFilePath"></label><label>每分钟最大请求数<input class="input" name="maxRequestsPerMinute" type="number"></label><label>并发连接上限<input class="input" name="maxConcurrentConnections" type="number"></label><label class="full" style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="logRequestBody" type="checkbox" style="width:auto">记录请求体（含敏感信息，仅调试时开启）</label></form></div>
+        <div class="card"><h3 style="margin:0 0 12px">路由规则</h3><p style="margin:0 0 10px;color:#6b7280;font-size:12px">对应原型里的 Codex 入站路径、转换方式、出站路径。</p><div id="routeRows" class="grid"></div><button id="addRouteRow" class="btn btn-secondary" style="margin-top:10px">添加路由规则</button></div>
+        <div class="card"><h3 style="margin:0 0 12px">模型映射</h3><p style="margin:0 0 10px;color:#6b7280;font-size:12px">请求体中的 model 字段会由 Hub 按当前厂商模型重写；这里保留映射参数用于可视化和后续扩展。</p><div id="modelRows" class="grid"></div><button id="addModelRow" class="btn btn-secondary" style="margin-top:10px">添加模型映射</button></div>
+      </div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">本地搜索</h3><p style="margin:0 0 12px;color:#6b7280">当提示需要实时信息时，Hub 可本地搜索并注入结果。</p><button id="toggleSearch" class="btn btn-secondary">切换本地搜索</button></div><div class="card"><h3 style="margin:0 0 12px">参数说明</h3><div class="notice">监听地址/端口当前由环境变量和启动常量决定，保存后会进入配置文件；需要下一步接线后才会驱动真实监听端口。超时、限流、Key 调度、路由规则已先作为可配置参数落盘。</div></div><div class="card"><h3 style="margin:0 0 12px">危险操作</h3><p style="margin:0 0 12px;color:#6b7280">恢复官方 OpenAI 配置会让 Codex 离开 Hub。</p><button id="uninstall" class="btn btn-danger">恢复官方配置</button></div></div></div></div></section>
     </main>
   </div>
 </div><div id="toast" class="toast"></div>
@@ -1067,14 +1155,21 @@ async function api(path, opts={}){ const headers={authorization:'Bearer '+AUTH_T
 function nav(page){ document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.nav button[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('page-'+page).classList.add('active'); if(page==='logs') loadLogs(); }
 document.querySelectorAll('.nav button[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));
 function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const active=p.id===lastStatus.activeProvider; el.innerHTML='<h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+'</div><div class="type url"></div><div class="row"></div>'; el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; const sw=document.createElement('button'); sw.className=active?'btn btn-success':'btn btn-primary'; sw.textContent=active?'当前使用':'切换到此厂商'; sw.disabled=active; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
-async function refresh(){ lastStatus=await api('/api/status'); $('sideApi').textContent=lastStatus.apiUrl; $('apiUrl').textContent=lastStatus.apiUrl; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=lastStatus.adapterRunning?'运行中':'按需启动'; $('activeTitle').textContent=lastStatus.activeProviderDisplayName||lastStatus.activeProvider; $('activeSub').textContent='当前 ID：'+lastStatus.activeProvider+' · 下一次 Codex 请求生效'; $('providerCount').textContent=lastStatus.providers.length; $('codexState').textContent=lastStatus.codexInstalled?'已接入':'未接入'; $('searchState').textContent=lastStatus.localSearch?.enabled?'开启':'关闭'; $('searchNote').textContent=lastStatus.localSearch?.onlyWhenLikelyNeeded?'只在需要时触发':'每次 web_search 触发'; const missing=lastStatus.providers.filter(p=>!p.hasKey).length; $('keyState').textContent=missing===0?'完整':missing+' 缺失'; $('sideStatus').className='status-pill '+(lastStatus.codexInstalled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=lastStatus.codexInstalled?'Hub 运行中':'待同步'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; lastStatus.providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); }
+async function refresh(){ lastStatus=await api('/api/status'); $('sideApi').textContent=lastStatus.apiUrl; $('apiUrl').textContent=lastStatus.apiUrl; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=lastStatus.adapterRunning?'运行中':'按需启动'; $('activeTitle').textContent=lastStatus.activeProviderDisplayName||lastStatus.activeProvider; $('activeSub').textContent='当前 ID：'+lastStatus.activeProvider+' · 下一次 Codex 请求生效'; $('providerCount').textContent=lastStatus.providers.length; $('codexState').textContent=lastStatus.codexInstalled?'已接入':'未接入'; $('searchState').textContent=lastStatus.localSearch?.enabled?'开启':'关闭'; $('searchNote').textContent=lastStatus.localSearch?.onlyWhenLikelyNeeded?'只在需要时触发':'每次 web_search 触发'; const missing=lastStatus.providers.filter(p=>!p.hasKey).length; $('keyState').textContent=missing===0?'完整':missing+' 缺失'; $('sideStatus').className='status-pill '+(lastStatus.codexInstalled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=lastStatus.codexInstalled?'Hub 运行中':'待同步'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; lastStatus.providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); fillGatewaySettings(lastStatus.gateway||{}); }
 function fillProviderForm(p){ const f=$('providerForm'); f.elements.id.value=p.id||''; f.elements.displayName.value=p.displayName||p.id||''; f.elements.type.value=p.type||'openai-chat'; f.elements.model.value=p.model||''; f.elements.baseUrl.value=p.baseUrl||''; f.elements.apiKey.value=''; $('providerFormTitle').textContent='编辑已保存厂商'; $('saveProvider').textContent='保存修改'; nav('providers'); toast((p.displayName||p.id)+' 已载入表单，API Key 留空会沿用已保存密钥。'); }
 function resetProviderForm(){ const f=$('providerForm'); f.reset(); $('providerFormTitle').textContent='添加自定义厂商'; $('saveProvider').textContent='保存厂商'; }
 async function loadLogs(){ try{ const r=await api('/api/logs?limit=160'); $('logs').innerHTML=(r.lines.length?r.lines:['暂无日志']).map(line=>'<div></div>').join(''); [...$('logs').children].forEach((el,i)=>el.textContent=r.lines[i]||'暂无日志'); }catch(e){ $('logs').textContent=e.message; } }
+function routeRow(route={}){ const el=document.createElement('div'); el.className='form'; el.innerHTML='<label>入站路径<input class="input" name="inbound" placeholder="POST /v1/responses"></label><label>转换方式<select name="mode"><option value="protocol-convert">协议转换</option><option value="passthrough">透传</option><option value="virtual-response">虚拟响应</option></select></label><label class="full">出站路径<input class="input" name="outbound" placeholder="POST /v1/responses"></label><label style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="enabled" type="checkbox" style="width:auto">启用</label><button type="button" class="btn btn-danger">删除</button>'; el.elements=Object.fromEntries([...el.querySelectorAll('[name]')].map(x=>[x.name,x])); el.elements.inbound.value=route.inbound||''; el.elements.mode.value=route.mode||'protocol-convert'; el.elements.outbound.value=route.outbound||''; el.elements.enabled.checked=route.enabled!==false; el.querySelector('button').onclick=()=>el.remove(); return el; }
+function modelRow(mapping={}){ const el=document.createElement('div'); el.className='form'; el.innerHTML='<label>Codex 模型名称<input class="input" name="input" placeholder="current"></label><label>输出模型名称<input class="input" name="output" placeholder="provider.model"></label><label style="display:flex;align-items:center;gap:8px;grid-template-columns:auto 1fr"><input name="enabled" type="checkbox" style="width:auto">启用</label><button type="button" class="btn btn-danger">删除</button>'; el.elements=Object.fromEntries([...el.querySelectorAll('[name]')].map(x=>[x.name,x])); el.elements.input.value=mapping.input||''; el.elements.output.value=mapping.output||''; el.elements.enabled.checked=mapping.enabled!==false; el.querySelector('button').onclick=()=>el.remove(); return el; }
+function fillGatewaySettings(g={}){ const f=$('gatewayForm'); if(!f) return; for(const [k,v] of Object.entries(g)){ if(!f.elements[k]) continue; if(f.elements[k].type==='checkbox') f.elements[k].checked=!!v; else f.elements[k].value=v; } $('routeRows').innerHTML=''; (g.routes||[]).forEach(r=>$('routeRows').append(routeRow(r))); $('modelRows').innerHTML=''; (g.modelMappings||[]).forEach(m=>$('modelRows').append(modelRow(m))); }
+function collectGatewaySettings(){ const f=$('gatewayForm'); const data=Object.fromEntries(new FormData(f).entries()); ['listenPort','uiPort','connectTimeoutMs','readTimeoutMs','maxRetries','maxRequestsPerMinute','maxConcurrentConnections'].forEach(k=>data[k]=Number(data[k])); data.logRequestBody=!!f.elements.logRequestBody.checked; data.routes=[...$('routeRows').children].map(row=>({inbound:row.elements.inbound.value,mode:row.elements.mode.value,outbound:row.elements.outbound.value,enabled:row.elements.enabled.checked})); data.modelMappings=[...$('modelRows').children].map(row=>({input:row.elements.input.value,output:row.elements.output.value,enabled:row.elements.enabled.checked})); return data; }
 $('refreshAll').onclick=()=>refresh().then(()=>toast('状态已刷新')).catch(e=>toast(e.message));
 $('openApi').onclick=()=>navigator.clipboard?.writeText(lastStatus?.apiUrl||'').then(()=>toast('API 地址已复制'));
 $('syncCodex').onclick=async()=>{ try{ const r=await api('/api/install-codex',{method:'POST'}); toast(r.message); await refresh(); }catch(e){ toast(e.message); } };
 $('testActive').onclick=async()=>{ try{ toast('正在测试当前厂商...'); const r=await api('/api/test-active',{method:'POST'}); toast('测试通过 HTTP '+r.status+' · '+r.latencyMs+'ms · '+r.sample); await refresh(); }catch(e){ toast(e.message); } };
+$('addRouteRow').onclick=()=>$('routeRows').append(routeRow({enabled:true}));
+$('addModelRow').onclick=()=>$('modelRows').append(modelRow({enabled:true}));
+$('saveGatewaySettings').onclick=async()=>{ try{ const r=await api('/api/gateway-settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(collectGatewaySettings())}); toast(r.message); fillGatewaySettings(r.gateway); await refresh(); }catch(e){ toast(e.message); } };
 $('toggleSearch').onclick=async()=>{ try{ const enabled=!lastStatus.localSearch?.enabled; await api('/api/local-search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({enabled,onlyWhenLikelyNeeded:true})}); toast('本地搜索已'+(enabled?'开启':'关闭')); await refresh(); }catch(e){ toast(e.message); } };
 $('uninstall').onclick=async()=>{ if(!confirm('确定恢复官方 OpenAI 配置吗？当前配置会备份到 data/ 目录。')) return; try{ const r=await api('/api/uninstall-codex',{method:'POST'}); toast(r.message+' 备份：'+r.backupPath); await refresh(); }catch(e){ toast(e.message); } };
 $('providerForm').onsubmit=async(e)=>{ e.preventDefault(); try{ const data=Object.fromEntries(new FormData(e.currentTarget).entries()); const r=await api('/api/providers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); toast('已保存：'+(r.provider.displayName||r.provider.id)); resetProviderForm(); await refresh(); }catch(err){ toast(err.message); } };
