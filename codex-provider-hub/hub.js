@@ -54,6 +54,7 @@ function removeHubPid() {
 const CONFIG_PATH = path.join(DATA_DIR, "providers.json");
 const KEYS_PATH = path.join(DATA_DIR, "keys.json");
 const AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token");
+const PREVIOUS_AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token.previous");
 const LOG_PATH = path.join(DATA_DIR, "hub.log");
 const STATS_PATH = path.join(DATA_DIR, "usage-stats.json");
 const ADAPTER_DATA_DIR = path.join(DATA_DIR, "mimo2codex");
@@ -65,6 +66,9 @@ const FUSECODE_AUTH_BACKUP = path.join(CODEX_DIR, "provider-switcher", "fusecode
 
 let adapter = null;
 let adapterKey = null;
+let codexAuthWatcher = null;
+let codexAuthSyncTimer = null;
+let lastCodexAuthSyncLogAt = 0;
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -106,6 +110,10 @@ function isValidAuthToken(token) {
   return /^[A-Za-z0-9_-]{32,}$/.test(token);
 }
 
+function isGeneratedHubAuthToken(token) {
+  return /^[A-Za-z0-9_-]{43}$/.test(String(token || "").trim());
+}
+
 function generateAuthToken() {
   return crypto.randomBytes(32).toString("base64url");
 }
@@ -124,6 +132,24 @@ function localAuthToken() {
   return token;
 }
 
+function previousAuthToken() {
+  try {
+    const token = readText(PREVIOUS_AUTH_TOKEN_PATH).trim();
+    return isValidAuthToken(token) ? token : "";
+  } catch {
+    return "";
+  }
+}
+
+function rawGatewayEnabled() {
+  return readJson(CONFIG_PATH, {}).gatewayEnabled === true;
+}
+
+function codexAuthOpenAiApiKey() {
+  const token = String(readJson(CODEX_AUTH_PATH, {}).OPENAI_API_KEY || "").trim();
+  return isValidAuthToken(token) ? token : "";
+}
+
 function bearerToken(req) {
   const match = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
   return match ? match[1].trim() : "";
@@ -136,11 +162,64 @@ function timingSafeEqualText(left, right) {
 }
 
 function hasValidAuth(req) {
-  return timingSafeEqualText(bearerToken(req), localAuthToken());
+  const incoming = bearerToken(req);
+  const current = localAuthToken();
+  if (timingSafeEqualText(incoming, current)) return true;
+  const previous = previousAuthToken();
+  if (previous && timingSafeEqualText(incoming, previous)) {
+    try {
+      writeCodexAuthToken(current);
+      appendLog("accepted previous auth token and resynced codex auth");
+    } catch (error) {
+      appendLog("codex auth resync failed", { message: error.message });
+    }
+    return true;
+  }
+  const codexAuthToken = codexAuthOpenAiApiKey();
+  if (rawGatewayEnabled() && codexAuthToken && timingSafeEqualText(incoming, codexAuthToken)) {
+    try {
+      writeCodexAuthToken(current);
+      appendLog("accepted current codex auth token and resynced hub auth");
+    } catch (error) {
+      appendLog("codex auth resync failed", { message: error.message });
+    }
+    return true;
+  }
+  return false;
 }
 
 function requireAuth(req, res) {
   if (hasValidAuth(req)) return true;
+  try {
+    if (loadConfig().gatewayEnabled === true) writeCodexAuthToken(localAuthToken());
+  } catch (error) {
+    appendLog("codex auth resync on 401 failed", { message: error.message });
+  }
+  sendJson(res, 401, { error: { type: "unauthorized", message: "Missing or invalid local auth token." } });
+  return false;
+}
+
+function isLoopbackRequest(req) {
+  const address = String(req.socket?.remoteAddress || "");
+  return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address);
+}
+
+function requireCodexApiAuth(req, res) {
+  if (hasValidAuth(req)) return true;
+  const incoming = bearerToken(req);
+  if (rawGatewayEnabled() && incoming && isLoopbackRequest(req)) {
+    try {
+      syncCodexAuthToken(loadConfig(), "loopback_api_bearer");
+    } catch (error) {
+      appendLog("codex auth loopback sync failed", { message: error.message });
+    }
+    return true;
+  }
+  try {
+    if (loadConfig().gatewayEnabled === true) writeCodexAuthToken(localAuthToken());
+  } catch (error) {
+    appendLog("codex auth resync on api 401 failed", { message: error.message });
+  }
   sendJson(res, 401, { error: { type: "unauthorized", message: "Missing or invalid local auth token." } });
   return false;
 }
@@ -345,7 +424,8 @@ function loadConfig() {
   if (normalizeConfig(config)) {
     saveConfig(config);
   }
-  syncCodexAuthToken(config);
+  syncCodexAuthToken(config, "config_load");
+  ensureCodexAuthWatch(config);
   return config;
 }
 
@@ -359,15 +439,72 @@ function loadKeys() {
 
 function writeCodexAuthToken(token) {
   const auth = readJson(CODEX_AUTH_PATH, {});
+  if (isGeneratedHubAuthToken(auth.OPENAI_API_KEY) && auth.OPENAI_API_KEY !== token) {
+    ensurePrivateDir(DATA_DIR);
+    fs.writeFileSync(PREVIOUS_AUTH_TOKEN_PATH, `${auth.OPENAI_API_KEY}\n`);
+    chmodPrivate(PREVIOUS_AUTH_TOKEN_PATH);
+  }
   auth.OPENAI_API_KEY = token;
   writeJson(CODEX_AUTH_PATH, auth, true);
 }
 
-function syncCodexAuthToken(config) {
-  if (config.gatewayEnabled !== true) return;
+function codexAuthStatus(config) {
   const token = localAuthToken();
   const auth = readJson(CODEX_AUTH_PATH, {});
-  if (auth.OPENAI_API_KEY !== token) writeCodexAuthToken(token);
+  return {
+    enabled: config.gatewayEnabled === true,
+    path: CODEX_AUTH_PATH,
+    synced: auth.OPENAI_API_KEY === token,
+    hasOpenAiApiKey: !!auth.OPENAI_API_KEY,
+    hasHubToken: auth.OPENAI_API_KEY === token,
+    previousTokenAccepted: !!previousAuthToken()
+  };
+}
+
+function syncCodexAuthToken(config, reason = "sync") {
+  if (config.gatewayEnabled !== true) return { ok: true, skipped: true, reason: "gateway_disabled" };
+  const token = localAuthToken();
+  const auth = readJson(CODEX_AUTH_PATH, {});
+  if (auth.OPENAI_API_KEY !== token) {
+    writeCodexAuthToken(token);
+    const now = Date.now();
+    if (now - lastCodexAuthSyncLogAt > 1000) {
+      appendLog("codex auth token synced", { reason, path: CODEX_AUTH_PATH });
+      lastCodexAuthSyncLogAt = now;
+    }
+    return { ok: true, changed: true, reason };
+  }
+  return { ok: true, changed: false, reason };
+}
+
+function ensureCodexAuthWatch(config) {
+  if (config.gatewayEnabled !== true) {
+    if (codexAuthWatcher) {
+      try { codexAuthWatcher.close(); } catch {}
+      codexAuthWatcher = null;
+    }
+    return;
+  }
+  ensurePrivateDir(CODEX_DIR);
+  if (!codexAuthWatcher) {
+    try {
+      codexAuthWatcher = fs.watch(CODEX_DIR, (eventType, filename) => {
+        if (String(filename || "") !== "auth.json") return;
+        clearTimeout(codexAuthSyncTimer);
+        codexAuthSyncTimer = setTimeout(() => {
+          try { syncCodexAuthToken(loadConfig(), `auth_json_${eventType || "changed"}`); } catch (error) {
+            appendLog("codex auth watch sync failed", { message: error.message });
+          }
+        }, 120);
+      });
+      codexAuthWatcher.on("error", (error) => {
+        appendLog("codex auth watcher failed", { message: error.message });
+        codexAuthWatcher = null;
+      });
+    } catch (error) {
+      appendLog("codex auth watcher setup failed", { message: error.message });
+    }
+  }
 }
 
 function providerById(config, id = config.activeProvider) {
@@ -780,6 +917,16 @@ function proxyHttp(url, req, res, body, headers = {}, meta = {}) {
       let payload = null;
       try { payload = JSON.parse(responseBody.toString("utf8")); } catch {}
       recordUsage({ ...meta, statusCode, latencyMs: Date.now() - started, payload, requestPayload: meta.requestPayload });
+      if (!payload && !/json/i.test(contentType)) {
+        const raw = responseBody.toString("utf8").trim();
+        sendJson(res, statusCode >= 200 && statusCode < 400 ? 502 : statusCode, {
+          error: {
+            type: "upstream_non_json_response",
+            message: raw ? raw.slice(0, 800) : `Upstream returned non-JSON response with HTTP ${statusCode}.`
+          }
+        });
+        return;
+      }
       res.writeHead(statusCode, upstreamRes.headers);
       res.end(responseBody);
     });
@@ -970,16 +1117,70 @@ function payloadHasMultimodal(value) {
   if (Array.isArray(value)) return value.some(payloadHasMultimodal);
   if (typeof value !== "object") return false;
   const type = String(value.type || "").toLowerCase();
-  if (["input_image", "image_url", "image", "input_file", "file", "audio", "input_audio"].includes(type)) return true;
-  if (value.image_url || value.file_id || value.file_data || value.input_image || value.input_audio) return true;
-  if (typeof value.mime_type === "string" && /^(image|audio|video|application\/pdf)/i.test(value.mime_type)) return true;
-  return Object.values(value).some(payloadHasMultimodal);
+  if (["input_image", "image_url", "image", "audio", "input_audio", "video", "input_video"].includes(type)) return true;
+  if (value.image_url || value.input_image || value.input_audio || value.input_video) return true;
+  if (typeof value.mime_type === "string" && /^(image|audio|video)\//i.test(value.mime_type)) return true;
+  if (typeof value.media_type === "string" && /^(image|audio|video)\//i.test(value.media_type)) return true;
+  return false;
+}
+
+function unsupportedMultimodalPlaceholder(value, provider) {
+  const type = String(value?.type || "").toLowerCase();
+  const mimeType = String(value?.mime_type || value?.media_type || "").toLowerCase();
+  let kind = "多模态";
+  if (type.includes("image") || mimeType.startsWith("image/") || value?.image_url || value?.input_image) kind = "图片";
+  else if (type.includes("audio") || mimeType.startsWith("audio/") || value?.input_audio) kind = "音频";
+  else if (type.includes("video") || mimeType.startsWith("video/") || value?.input_video) kind = "视频";
+  const providerName = provider?.displayName || provider?.id || "当前厂商";
+  const text = `[Codex Switcher: ${providerName} 不支持${kind}输入，已忽略该媒体内容。请基于可用文本继续；如果必须读取该媒体，请切换到支持多模态的厂商。]`;
+  return type === "image_url" ? { type: "text", text } : { type: "input_text", text };
+}
+
+function replaceUnsupportedMultimodal(value, provider, stats = { replaced: 0 }) {
+  if (!value) return value;
+  if (Array.isArray(value)) return value.map((item) => replaceUnsupportedMultimodal(item, provider, stats));
+  if (typeof value !== "object") return value;
+  if (payloadHasMultimodal(value)) {
+    stats.replaced += 1;
+    return unsupportedMultimodalPlaceholder(value, provider);
+  }
+  const next = {};
+  for (const [key, item] of Object.entries(value)) {
+    next[key] = replaceUnsupportedMultimodal(item, provider, stats);
+  }
+  return next;
+}
+
+function stripUnsupportedTools(payload, provider) {
+  if (provider.type === "responses") return;
+  if (payload.tools || payload.tool_choice || payload.parallel_tool_calls) {
+    delete payload.tools;
+    delete payload.tool_choice;
+    delete payload.parallel_tool_calls;
+    appendLog("stripped unsupported tool options", { provider: provider.id });
+  }
+}
+
+function payloadUserContent(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.flatMap(payloadUserContent);
+  if (typeof value !== "object") return [];
+  if (Object.prototype.hasOwnProperty.call(value, "content")) return payloadUserContent(value.content);
+  if (Object.prototype.hasOwnProperty.call(value, "type")) return [value];
+  return [];
 }
 
 function ensureMultimodalSupported(payload, provider) {
-  if (!payloadHasMultimodal(payload)) return;
+  const userContent = [
+    ...payloadUserContent(payload?.input),
+    ...payloadUserContent(payload?.messages)
+  ];
+  if (!payloadHasMultimodal(userContent)) return;
   if (provider.supportsMultimodal === true) return;
-  throw new Error(`当前厂商 ${provider.displayName || provider.id} 未开启多模态支持。请切换支持图片/文件输入的模型，或在厂商编辑中开启“支持多模态输入”。`);
+  const stats = { replaced: 0 };
+  payload.input = replaceUnsupportedMultimodal(payload.input, provider, stats);
+  payload.messages = replaceUnsupportedMultimodal(payload.messages, provider, stats);
+  appendLog("replaced unsupported multimodal input", { provider: provider.id, replaced: stats.replaced });
 }
 
 async function prepareProviderForSwitch(provider) {
@@ -1017,6 +1218,7 @@ async function handleResponses(req, res) {
     return;
   }
   rewriteModel(payload, provider, config);
+  stripUnsupportedTools(payload, provider);
   payload = await applyLocalSearch(payload, config);
 
   if (provider.type === "responses") {
@@ -1062,6 +1264,7 @@ request_max_retries = 3`;
   writeCodexAuthToken(localAuthToken());
   config.gatewayEnabled = true;
   saveConfig(config);
+  ensureCodexAuthWatch(config);
 }
 
 function ensureProxyMode() {
@@ -1092,8 +1295,7 @@ function disableProxyMode() {
   if (typeof config.codexConfigBeforeProxy === "string") {
     next = config.codexConfigBeforeProxy.replace(/\s+$/u, "") + "\n";
   } else {
-    const escaped = "model_providers.provider-hub".replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const sectionRe = new RegExp(`(^|\\n)\\[${escaped}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`);
+    const sectionRe = tomlSectionRegex("model_providers.provider-hub");
     const cleaned = existing.replace(sectionRe, "$1").replace(/\n{3,}/g, "\n\n").replace(/\s+$/u, "") + "\n";
     next = setTopLevel(cleaned, {
       model_provider: "\"openai\"",
@@ -1108,6 +1310,7 @@ function disableProxyMode() {
   config.gatewayEnabled = false;
   delete config.codexConfigBeforeProxy;
   saveConfig(config);
+  ensureCodexAuthWatch(config);
 
   return backupPath;
 }
@@ -1131,9 +1334,13 @@ function setTopLevel(text, orderedAssignments, removeKeys = []) {
   return [...assignments, ...kept, "", ...rest].join("\n").replace(/\n{3,}/g, "\n\n").replace(/\s+$/u, "") + "\n";
 }
 
+function tomlSectionRegex(sectionName) {
+  const escaped = String(sectionName || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|\\n)\\[${escaped}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`);
+}
+
 function upsertSection(text, sectionName, block) {
-  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const sectionRe = new RegExp(`(^|\\n)\\[${escaped}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`);
+  const sectionRe = tomlSectionRegex(sectionName);
   if (sectionRe.test(text)) return text.replace(sectionRe, (match, prefix) => `${prefix}${block}\n`);
   return text.replace(/\s+$/u, "") + "\n\n" + block + "\n";
 }
@@ -1171,6 +1378,7 @@ async function statusPayload() {
     providers: config.providers.map(redactedProvider),
     localSearch: config.localSearch,
     gateway: config.gateway,
+    codexAuth: codexAuthStatus(config),
     usageStats: loadUsageStats(),
     adapterPort: ADAPTER_PORT
   };
@@ -1252,6 +1460,21 @@ async function handleApi(req, res) {
       return;
     }
     sendJson(res, 200, { ok: true, enabled: true, message: "代理已启动：Codex 将通过本地代理使用当前厂商。" });
+    return;
+  }
+  if (req.method === "POST" && pathname === "/api/repair-auth") {
+    const config = loadConfig();
+    if (config.gatewayEnabled !== true) {
+      sendJson(res, 200, { ok: true, message: "当前是官方模式，无需修复本地鉴权。", codexAuth: codexAuthStatus(config) });
+      return;
+    }
+    const result = syncCodexAuthToken(config, "manual_repair");
+    ensureCodexAuthWatch(config);
+    sendJson(res, 200, {
+      ok: true,
+      message: result.changed ? "已修复：Codex 本地鉴权已重新同步。" : "鉴权正常：Codex 本地 token 已同步。",
+      codexAuth: codexAuthStatus(config)
+    });
     return;
   }
   if (req.method === "POST" && pathname === "/api/switch") {
@@ -1384,7 +1607,7 @@ async function handleApi(req, res) {
   sendJson(res, 404, { ok: false, message: "Not found" });
 }
 
-function html({ desktopMac = false } = {}) {
+function html({ desktop = false, desktopMac = false } = {}) {
   const bodyClass = desktopMac ? "desktop-mac" : "";
   return `<!doctype html>
 <html lang="zh-CN">
@@ -1428,11 +1651,11 @@ function html({ desktopMac = false } = {}) {
     </aside>
     <main class="content">
       <section id="page-overview" class="page active">
-        <header class="page-header"><div><div class="page-title">运行概览</div><div class="page-sub" id="gatewaySubtitle">启动代理时 Codex 使用当前厂商；关闭代理时恢复官方 OpenAI。</div></div><div class="actions"><span id="gatewayModeBadge" class="badge badge-muted">读取中</span><button id="gatewayToggle" class="btn btn-primary">启动代理</button><button id="testActive" class="btn btn-secondary">测试当前厂商</button></div></header>
+        <header class="page-header"><div><div class="page-title">运行概览</div><div class="page-sub" id="gatewaySubtitle">启动代理时 Codex 使用当前厂商；关闭代理时恢复官方 OpenAI。</div></div><div class="actions"><span id="gatewayModeBadge" class="badge badge-muted">读取中</span><button id="gatewayToggle" class="btn btn-primary">启动代理</button><button id="testActive" class="btn btn-secondary">测试当前厂商</button><button id="repairAuth" class="btn btn-secondary">修复鉴权</button></div></header>
         <div class="page-body">
           <div class="hero"><div><h2 id="activeTitle">当前厂商</h2><p id="activeSub">读取中...</p><div class="meta"><div>API <code id="apiUrl">-</code></div><div>数据目录 <code id="dataDir">-</code></div><div>Adapter <code id="adapterState">-</code></div></div></div><span id="activeBadge" class="badge badge-blue">Current</span></div>
           <div class="grid stats"><div class="card"><div class="stat-label">总请求</div><div id="requestCount" class="stat-value">-</div><div class="stat-note" id="errorRate">错误率 -</div></div><div class="card"><div class="stat-label">Token 用量</div><div id="tokenTotal" class="stat-value">-</div><div class="stat-note" id="tokenSplit">输入 - / 输出 -</div></div><div class="card"><div class="stat-label">当前模型用量</div><div id="activeModelTokens" class="stat-value">-</div><div class="stat-note" id="activeModelName">-</div></div><div class="card"><div class="stat-label">密钥状态</div><div id="keyState" class="stat-value">-</div><div class="stat-note">缺失时不可切换</div></div></div>
-          <div class="grid split"><div class="grid"><div class="card"><h3 style="margin:0 0 12px">Token 用量趋势（近 7 天）</h3><div id="tokenChart" class="chart"></div></div><div class="card"><h3 style="margin:0 0 12px">快速切换</h3><div id="quickProviders" class="grid providers"></div></div></div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">模型用量排行</h3><div id="modelUsage" class="grid"></div></div><div class="card"><h3 style="margin:0 0 12px">操作反馈</h3><div id="messagePanel" class="notice">准备就绪。选择厂商后，下次 Codex 请求会使用新厂商。</div></div></div></div>
+          <div class="grid split"><div class="grid"><div class="card"><h3 style="margin:0 0 12px">Token 用量趋势（近 7 天）</h3><div id="tokenChart" class="chart"></div></div><div class="card"><h3 style="margin:0 0 12px">快速切换</h3><div id="quickProviders" class="grid providers"></div></div></div><div class="grid"><div class="card"><h3 style="margin:0 0 12px">模型用量排行</h3><div id="modelUsage" class="grid"></div></div><div class="card"><h3 style="margin:0 0 12px">操作反馈</h3><div id="messagePanel" class="notice">准备就绪。选择厂商后，下次 Codex 请求会使用新厂商。</div><div id="authPanel" class="notice" style="margin-top:10px">本地鉴权状态读取中...</div></div></div></div>
         </div>
       </section>
       <section id="page-providers" class="page"><header class="page-header"><div><div class="page-title">厂商管理</div><div class="page-sub">新增、编辑、测试并切换 OpenAI 兼容或 Responses 厂商。</div></div><div class="actions"><button id="clearProviderForm" class="btn btn-secondary">新增厂商</button></div></header><div class="page-body"><div id="providers" class="grid providers"></div></div></section>
@@ -1464,15 +1687,47 @@ function html({ desktopMac = false } = {}) {
 <div id="toast" class="toast"></div>
 <script>
 const AUTH_TOKEN = ${JSON.stringify(localAuthToken())};
+const IS_DESKTOP = ${desktop ? "true" : "false"};
 const $ = (id) => document.getElementById(id);
 let lastStatus = null;
+let reconnecting = false;
 function toast(text){ const el=$('toast'); el.textContent=text; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),3500); $('messagePanel') && ($('messagePanel').textContent=text); }
-async function api(path, opts={}){ const headers={authorization:'Bearer '+AUTH_TOKEN,...(opts.headers||{})}; const res=await fetch(path,{cache:'no-store',...opts,headers}); const data=await res.json(); if(!res.ok||data.ok===false) throw new Error(data.message||data.error?.message||'request failed'); return data; }
+function sleep(ms){ return new Promise(resolve=>setTimeout(resolve,ms)); }
+async function api(path, opts={}){
+  const headers={authorization:'Bearer '+AUTH_TOKEN,...(opts.headers||{})};
+  const attempts=opts.retry===false?1:4;
+  let lastError=null;
+  for(let i=0;i<attempts;i++){
+    try{
+      const res=await fetch(path,{cache:'no-store',...opts,headers});
+      const text=await res.text();
+      let data={};
+      try{ data=text?JSON.parse(text):{}; }catch{ data={ message:text||'request failed' }; }
+      if(res.status===401&&IS_DESKTOP){ setTimeout(()=>location.reload(),300); throw new Error('本地鉴权已刷新，正在重载控制台...'); }
+      if(!res.ok||data.ok===false) throw new Error(data.message||data.error?.message||'request failed');
+      reconnecting=false;
+      return data;
+    }catch(error){
+      lastError=error;
+      const message=String(error?.message||error||'');
+      const retryable=message.includes('Failed to fetch')||message.includes('NetworkError')||message.includes('Load failed')||message.includes('request failed');
+      if(!retryable||i===attempts-1) break;
+      if(!reconnecting){ reconnecting=true; toast('Hub 连接中断，正在自动重连...'); }
+      await sleep(350*(i+1));
+    }
+  }
+  if(IS_DESKTOP&&reconnecting){
+    toast('Hub 正在恢复，控制台即将自动刷新。');
+    setTimeout(()=>location.reload(),1200);
+  }
+  throw lastError||new Error('request failed');
+}
 function nav(page){ document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.nav button[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('page-'+page).classList.add('active'); if(page==='logs') loadLogs(); }
 document.querySelectorAll('.nav button[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));
 function notice(text){ const el=document.createElement('div'); el.className='notice'; el.textContent=text; return el; }
 function providerCard(p, compact=false){ const el=document.createElement('div'); el.className='provider'+(compact?' compact':'')+(p.id===lastStatus.activeProvider?' active':''); const keyBadge=p.hasKey?'<span class="badge badge-ok">key</span>':'<span class="badge badge-warn">missing key</span>'; const multimodalBadge=p.supportsMultimodal?'<span class="badge badge-blue">multi</span>':''; const active=p.id===lastStatus.activeProvider; const usage=(lastStatus.usageStats?.byProvider||{})[p.id]||{}; const errorRate=usage.requests?((usage.errors||0)/usage.requests*100).toFixed(1):'0.0'; el.innerHTML='<div class="provider-main"><h3></h3><div class="type"><span class="badge badge-muted"></span><span class="code"></span>'+keyBadge+multimodalBadge+'</div><div class="type url"></div><div class="row"></div></div>'+(compact?'':'<div class="provider-usage"><div><div class="usage-title">Token 用量</div><div class="usage-total"></div></div><div class="usage-grid"><div class="usage-mini"><strong data-k="requests"></strong><span>请求数</span></div><div class="usage-mini"><strong data-k="input"></strong><span>输入 Token</span></div><div class="usage-mini"><strong data-k="output"></strong><span>输出 Token</span></div></div><div style="font-size:12px;color:#6b7280"></div></div>'); el.querySelector('h3').textContent=p.displayName||p.id; el.querySelector('.badge-muted').textContent=p.type||'provider'; el.querySelector('.code').textContent=p.model||p.id; el.querySelector('.url').textContent=p.baseUrl||''; if(!compact){ el.querySelector('.usage-total').textContent=fmt(usage.totalTokens||0); el.querySelector('[data-k="requests"]').textContent=fmt(usage.requests||0); el.querySelector('[data-k="input"]').textContent=fmt(usage.inputTokens||0); el.querySelector('[data-k="output"]').textContent=fmt(usage.outputTokens||0); el.querySelector('.provider-usage').lastElementChild.textContent='错误率 '+errorRate+'%'+(usage.estimatedRequests?' · 估算 '+usage.estimatedRequests+' 次':''); } const sw=document.createElement('button'); sw.className=active?'btn btn-success':(p.hasKey?'btn btn-primary':'btn btn-secondary'); sw.textContent=active?'当前使用':(p.hasKey?'切换到此厂商':'缺少密钥'); sw.disabled=active||!p.hasKey; sw.onclick=async()=>{ try{ sw.disabled=true; sw.textContent='切换中...'; const r=await api('/api/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:p.id})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); await refresh(); } }; el.querySelector('.row').append(sw); if(!compact){ const edit=document.createElement('button'); edit.className='btn btn-secondary'; edit.textContent='编辑'; edit.onclick=()=>fillProviderForm(p); el.querySelector('.row').append(edit); } return el; }
-async function refresh(){ lastStatus=await api('/api/status'); const providers=lastStatus.providers||[]; const activeProvider=providers.find(p=>p.id===lastStatus.activeProvider); const canUseProvider=!!(activeProvider&&activeProvider.hasKey); const enabled=!!lastStatus.gatewayEnabled; $('sideApi').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('apiUrl').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=enabled?(lastStatus.adapterRunning?'运行中':'按需启动'):'已关闭'; if(!providers.length){ $('activeTitle').textContent='尚未添加厂商'; $('activeSub').textContent='请先在厂商管理中手动添加厂商和 API Key。'; } else if(activeProvider){ $('activeTitle').textContent=activeProvider.displayName||activeProvider.id; $('activeSub').textContent='当前 ID：'+activeProvider.id+(enabled?' · 下一次 Codex 请求会走本地代理':' · 代理关闭时 Codex 使用官方 OpenAI'); } else { $('activeTitle').textContent='尚未选择厂商'; $('activeSub').textContent='请选择一个已保存密钥的厂商后再启动代理。'; } $('gatewaySubtitle').textContent=enabled?'代理已启动：Codex 使用当前厂商。':'代理已关闭：Codex 使用官方 OpenAI。'; $('gatewayModeBadge').className='badge '+(enabled?'badge-success':'badge-danger'); $('gatewayModeBadge').textContent=enabled?'● 代理已启动':'● 代理已关闭'; $('gatewayToggle').className='btn '+(enabled?'btn-danger':'btn-primary'); $('gatewayToggle').textContent=enabled?'关闭代理':'启动代理'; $('gatewayToggle').disabled=!enabled&&!canUseProvider; $('testActive').disabled=!canUseProvider; $('activeBadge').textContent=enabled?'Proxy':(canUseProvider?'Ready':'Manual'); updateUsageStats(lastStatus.usageStats||{}); const missing=providers.filter(p=>!p.hasKey).length; $('keyState').textContent=providers.length?(missing===0?'完整':missing+' 缺失'):'未配置'; $('sideStatus').className='status-pill '+(enabled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=enabled?'代理模式':'官方模式'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; if(!providers.length){ $('providers').append(notice('暂无厂商配置，请使用右侧表单手动添加。')); $('quickProviders').append(notice('暂无可切换厂商。')); } else { providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); } fillGatewaySettings(lastStatus.gateway||{}); }
+function updateAuthPanel(){ const auth=lastStatus?.codexAuth||{}; const enabled=!!lastStatus?.gatewayEnabled; if(!enabled){ $('authPanel').textContent='官方模式：不会改写 Codex 本地鉴权。'; $('repairAuth').disabled=true; $('repairAuth').textContent='无需修复'; return; } if(auth.synced){ $('authPanel').textContent='鉴权正常：Codex 本地 token 已同步，后续会自动守护。'; $('repairAuth').disabled=false; $('repairAuth').textContent='重新同步鉴权'; return; } $('authPanel').textContent='检测到鉴权不同步：已开启自动修复，也可以点击“修复鉴权”立即同步。'; $('repairAuth').disabled=false; $('repairAuth').textContent='修复鉴权'; }
+async function refresh(){ lastStatus=await api('/api/status'); const providers=lastStatus.providers||[]; const activeProvider=providers.find(p=>p.id===lastStatus.activeProvider); const canUseProvider=!!(activeProvider&&activeProvider.hasKey); const enabled=!!lastStatus.gatewayEnabled; $('sideApi').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('apiUrl').textContent=enabled?lastStatus.apiUrl:'官方 OpenAI'; $('dataDir').textContent=lastStatus.dataDir; $('adapterState').textContent=enabled?(lastStatus.adapterRunning?'运行中':'按需启动'):'已关闭'; if(!providers.length){ $('activeTitle').textContent='尚未添加厂商'; $('activeSub').textContent='请先在厂商管理中手动添加厂商和 API Key。'; } else if(activeProvider){ $('activeTitle').textContent=activeProvider.displayName||activeProvider.id; $('activeSub').textContent='当前 ID：'+activeProvider.id+(enabled?' · 下一次 Codex 请求会走本地代理':' · 代理关闭时 Codex 使用官方 OpenAI'); } else { $('activeTitle').textContent='尚未选择厂商'; $('activeSub').textContent='请选择一个已保存密钥的厂商后再启动代理。'; } $('gatewaySubtitle').textContent=enabled?'代理已启动：Codex 使用当前厂商。':'代理已关闭：Codex 使用官方 OpenAI。'; $('gatewayModeBadge').className='badge '+(enabled?'badge-success':'badge-danger'); $('gatewayModeBadge').textContent=enabled?'● 代理已启动':'● 代理已关闭'; $('gatewayToggle').className='btn '+(enabled?'btn-danger':'btn-primary'); $('gatewayToggle').textContent=enabled?'关闭代理':'启动代理'; $('gatewayToggle').disabled=!enabled&&!canUseProvider; $('testActive').disabled=!canUseProvider; $('activeBadge').textContent=enabled?'Proxy':(canUseProvider?'Ready':'Manual'); updateAuthPanel(); updateUsageStats(lastStatus.usageStats||{}); const missing=providers.filter(p=>!p.hasKey).length; $('keyState').textContent=providers.length?(missing===0?'完整':missing+' 缺失'):'未配置'; $('sideStatus').className='status-pill '+(enabled?'ok':'warn'); $('sideStatus').lastElementChild.textContent=enabled?'代理模式':'官方模式'; $('providers').innerHTML=''; $('quickProviders').innerHTML=''; if(!providers.length){ $('providers').append(notice('暂无厂商配置，请使用右侧表单手动添加。')); $('quickProviders').append(notice('暂无可切换厂商。')); } else { providers.forEach(p=>{ $('providers').append(providerCard(p)); $('quickProviders').append(providerCard(p,true)); }); } fillGatewaySettings(lastStatus.gateway||{}); }
 function setApiKeyVisible(visible){ const f=$('providerForm'); f.elements.apiKey.type=visible?'text':'password'; $('toggleApiKeyVisibility').textContent=visible?'隐藏':'显示'; }
 function resetProviderForm(){ const f=$('providerForm'); f.reset(); f.elements.id.readOnly=false; setApiKeyVisible(false); f.querySelectorAll('select').forEach(syncCustomSelect); $('providerFormTitle').textContent='添加厂商'; $('saveProvider').textContent='保存厂商'; }
 function openProviderModal(){ enhanceSelects($('providerForm')); $('providerModal').hidden=false; setTimeout(()=>$('providerForm').elements.id.focus(),0); }
@@ -1556,6 +1811,7 @@ $('refreshAll').onclick=()=>refresh().then(()=>toast('状态已刷新')).catch(e
 $('openApi').onclick=()=>navigator.clipboard?.writeText(lastStatus?.apiUrl||'').then(()=>toast('API 地址已复制'));
 $('gatewayToggle').onclick=async()=>{ try{ const enabled=!lastStatus.gatewayEnabled; const r=await api('/api/gateway-toggle',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({enabled})}); toast(r.message); await refresh(); }catch(e){ toast(e.message); } };
 $('testActive').onclick=async()=>{ try{ toast('正在测试当前厂商...'); const r=await api('/api/test-active',{method:'POST'}); toast('测试通过 · HTTP '+r.status+' · '+r.latencyMs+'ms · '+r.sample); await refresh(); }catch(e){ toast(e.message); } };
+$('repairAuth').onclick=async()=>{ try{ const r=await api('/api/repair-auth',{method:'POST'}); toast(r.message); await refresh(); }catch(e){ toast(e.message); } };
 $('addRouteRow').onclick=()=>$('routeRows').append(routeRow({enabled:true}));
 $('addModelRow').onclick=()=>$('modelRows').append(modelRow({enabled:true}));
 $('saveGatewaySettings').onclick=async()=>{ try{ const r=await api('/api/gateway-settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(collectGatewaySettings())}); toast(r.message); fillGatewaySettings(r.gateway); await refresh(); }catch(e){ toast(e.message); } };
@@ -1576,7 +1832,7 @@ enhanceSelects(); refresh().then(loadLogs).catch(e=>toast(e.message)); setInterv
 
 const apiServer = http.createServer(async (req, res) => {
   try {
-    if (!requireAuth(req, res)) return;
+    if (!requireCodexApiAuth(req, res)) return;
     const config = loadConfig();
     const pathname = new URL(req.url || "/", `http://${API_HOST}:${API_PORT}`).pathname;
     if (req.method === "GET" && pathname === "/v1/models") {
@@ -1604,6 +1860,7 @@ const uiServer = http.createServer(async (req, res) => {
         "content-security-policy": "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
       }));
       res.end(html({
+        desktop: requestUrl.searchParams.get("desktop") === "1",
         desktopMac: requestUrl.searchParams.get("desktop") === "1" && requestUrl.searchParams.get("platform") === "darwin"
       }));
       return;

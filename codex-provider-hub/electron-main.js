@@ -15,6 +15,8 @@ let mainWindow = null;
 let tray = null;
 let hubProcess = null;
 let isQuitting = false;
+let hubWatchdogTimer = null;
+let hubRecoveryRunning = false;
 
 function canConnect(timeoutMs = 400) {
   return new Promise((resolve) => {
@@ -125,8 +127,38 @@ async function ensureHub() {
   });
   hubProcess.on("exit", () => {
     hubProcess = null;
+    if (!isQuitting) setTimeout(() => recoverHub("process_exit"), 300);
   });
   if (!await waitForHub()) throw new Error(`Codex Provider Hub did not start on ${UI_PORT}`);
+}
+
+function reloadWindowAfterHubRecovery() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.reloadIgnoringCache();
+}
+
+async function recoverHub(reason = "watchdog") {
+  if (isQuitting || hubRecoveryRunning) return;
+  hubRecoveryRunning = true;
+  try {
+    await ensureHub();
+    reloadWindowAfterHubRecovery();
+  } catch (error) {
+    console.error(`Codex Switcher Hub recovery failed (${reason}):`, error);
+  } finally {
+    hubRecoveryRunning = false;
+  }
+}
+
+function startHubWatchdog() {
+  if (hubWatchdogTimer) return;
+  hubWatchdogTimer = setInterval(async () => {
+    if (isQuitting) return;
+    if (!isOwnedHub(await requestStatus(900))) {
+      await recoverHub("watchdog");
+    }
+  }, 5000);
+  if (typeof hubWatchdogTimer.unref === "function") hubWatchdogTimer.unref();
 }
 
 function createWindow() {
@@ -193,6 +225,7 @@ app.whenReady().then(async () => {
   await ensureHub();
   createWindow();
   createTray();
+  startHubWatchdog();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
     else mainWindow?.show();
@@ -204,6 +237,7 @@ app.whenReady().then(async () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  if (hubWatchdogTimer) clearInterval(hubWatchdogTimer);
 });
 
 app.on("window-all-closed", () => {
