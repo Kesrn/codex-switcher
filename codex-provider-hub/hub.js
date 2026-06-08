@@ -57,6 +57,9 @@ const AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token");
 const PREVIOUS_AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token.previous");
 const LOG_PATH = path.join(DATA_DIR, "hub.log");
 const STATS_PATH = path.join(DATA_DIR, "usage-stats.json");
+const HIDDEN_LOG_PATTERNS = [
+  "stripped unsupported tool options"
+];
 const ADAPTER_DATA_DIR = path.join(DATA_DIR, "mimo2codex");
 const ADAPTER_AUTH_TOKEN_PATH = path.join(ADAPTER_DATA_DIR, "hub-api-token");
 const CODEX_DIR = path.join(os.homedir(), ".codex");
@@ -250,6 +253,10 @@ function appendLog(message, extra) {
   ensureDir(DATA_DIR);
   const line = `[${new Date().toISOString()}] ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}\n`;
   fs.appendFileSync(LOG_PATH, line);
+}
+
+function shouldShowLogLine(line) {
+  return !HIDDEN_LOG_PATTERNS.some((pattern) => line.includes(pattern));
 }
 
 function readEnvFile(file) {
@@ -1157,7 +1164,6 @@ function stripUnsupportedTools(payload, provider) {
     delete payload.tools;
     delete payload.tool_choice;
     delete payload.parallel_tool_calls;
-    appendLog("stripped unsupported tool options", { provider: provider.id });
   }
 }
 
@@ -1391,7 +1397,7 @@ async function readJsonBody(req) {
 function readRecentLogLines(limit = 120) {
   try {
     const text = readText(LOG_PATH);
-    return text.split(/\r?\n/).filter(Boolean).slice(-limit).reverse();
+    return text.split(/\r?\n/).filter(Boolean).filter(shouldShowLogLine).slice(-limit).reverse();
   } catch {
     return [];
   }
