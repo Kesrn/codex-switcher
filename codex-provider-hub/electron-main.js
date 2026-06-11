@@ -10,6 +10,8 @@ const API_HOST = "127.0.0.1";
 const UI_PORT = Number(process.env.CODEX_PROVIDER_HUB_UI_PORT || 8790);
 const DATA_DIR = process.env.CODEX_PROVIDER_HUB_DATA_DIR || path.join(app.getPath("userData"), "data");
 const AUTH_TOKEN_PATH = path.join(DATA_DIR, "auth-token");
+const HUB_PID_PATH = path.join(DATA_DIR, "hub.pid");
+const APP_VERSION = app.getVersion();
 
 let mainWindow = null;
 let tray = null;
@@ -100,17 +102,70 @@ function isOwnedHub(status) {
   return status?.appId === APP_ID && path.normalize(status.dataDir || "") === path.normalize(DATA_DIR);
 }
 
+function isCurrentOwnedHub(status) {
+  if (!isOwnedHub(status)) return false;
+  if (!app.isPackaged) return true;
+  return status.appVersion === APP_VERSION;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readHubPid() {
+  try {
+    const value = Number(fs.readFileSync(HUB_PID_PATH, "utf8").trim());
+    return Number.isInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function processAlive(pid) {
+  if (!pid || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForHubStop(timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!await canConnect(250)) return true;
+    await delay(120);
+  }
+  return !await canConnect(250);
+}
+
+async function stopExistingHub(reason = "replace") {
+  const pid = readHubPid();
+  if (!pid || !processAlive(pid)) return;
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  if (!await waitForHubStop()) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+    await waitForHubStop(1500);
+  }
+  console.warn(`Stopped existing Codex Switcher Hub (${reason}) pid=${pid}`);
+}
+
 async function waitForHub(timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (isOwnedHub(await requestStatus())) return true;
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    if (isCurrentOwnedHub(await requestStatus())) return true;
+    await delay(180);
   }
   return false;
 }
 
 async function ensureHub() {
-  if (isOwnedHub(await requestStatus())) return;
+  const status = await requestStatus();
+  if (isCurrentOwnedHub(status)) return;
+  if (isOwnedHub(status)) {
+    await stopExistingHub(`version_mismatch:${status.appVersion || "unknown"}->${APP_VERSION}`);
+  }
   if (await canConnect()) {
     throw new Error(`Port ${UI_PORT} is already used by another Hub. Stop the old Hub first, then reopen Codex Switcher.`);
   }
@@ -120,6 +175,7 @@ async function ensureHub() {
     env: {
       ...process.env,
       CODEX_PROVIDER_HUB_DATA_DIR: DATA_DIR,
+      CODEX_SWITCHER_APP_VERSION: APP_VERSION,
       ELECTRON_RUN_AS_NODE: "1"
     },
     stdio: "ignore",
@@ -154,7 +210,7 @@ function startHubWatchdog() {
   if (hubWatchdogTimer) return;
   hubWatchdogTimer = setInterval(async () => {
     if (isQuitting) return;
-    if (!isOwnedHub(await requestStatus(900))) {
+    if (!isCurrentOwnedHub(await requestStatus(900))) {
       await recoverHub("watchdog");
     }
   }, 5000);

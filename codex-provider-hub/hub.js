@@ -12,6 +12,13 @@ const { pathToFileURL } = require("url");
 
 const ROOT = __dirname;
 const APP_ID = "cc.codex-switcher.app";
+const APP_VERSION = process.env.CODEX_SWITCHER_APP_VERSION || (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version || "dev";
+  } catch {
+    return "dev";
+  }
+})();
 const API_HOST = "127.0.0.1";
 const DEFAULT_CODEX_MODEL_ALIAS = "gpt-5.5";
 const API_PORT = Number(process.env.CODEX_PROVIDER_HUB_API_PORT || 8789);
@@ -61,6 +68,7 @@ const HIDDEN_LOG_PATTERNS = [
   "stripped unsupported tool options"
 ];
 const ADAPTER_DATA_DIR = path.join(DATA_DIR, "mimo2codex");
+const ADAPTER_PID_PATH = path.join(ADAPTER_DATA_DIR, "adapter.pid");
 const ADAPTER_AUTH_TOKEN_PATH = path.join(ADAPTER_DATA_DIR, "hub-api-token");
 const CODEX_DIR = path.join(os.homedir(), ".codex");
 const CODEX_CONFIG_PATH = path.join(CODEX_DIR, "config.toml");
@@ -1000,12 +1008,132 @@ function adapterSignature(provider) {
   });
 }
 
-function stopAdapter() {
-  if (adapter?.process && !adapter.process.killed) {
-    adapter.process.kill();
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function adapterProcessAlive(child) {
+  return !!child && child.exitCode === null && child.signalCode === null && !child.killed;
+}
+
+function processAlive(pid) {
+  const value = Number(pid);
+  if (!Number.isInteger(value) || value <= 0) return false;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch {
+    return false;
   }
+}
+
+function readAdapterPid() {
+  try {
+    const value = Number(readText(ADAPTER_PID_PATH).trim());
+    return Number.isInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAdapterPid(pid) {
+  ensurePrivateDir(ADAPTER_DATA_DIR);
+  fs.writeFileSync(ADAPTER_PID_PATH, `${pid}\n`);
+  chmodPrivate(ADAPTER_PID_PATH);
+}
+
+function removeAdapterPid(pid) {
+  const current = readAdapterPid();
+  if (pid && current && current !== pid) return;
+  try { fs.unlinkSync(ADAPTER_PID_PATH); } catch {}
+}
+
+async function waitForProcessExit(pid, timeoutMs = 1800) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processAlive(pid)) return true;
+    await delay(120);
+  }
+  return !processAlive(pid);
+}
+
+async function terminatePid(pid, reason) {
+  if (!processAlive(pid) || pid === process.pid) return;
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  if (!await waitForProcessExit(pid)) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+    await waitForProcessExit(pid, 1200);
+  }
+  appendLog("adapter process stopped", { pid, reason });
+}
+
+function adapterPortPids() {
+  try {
+    if (process.platform === "win32") {
+      const output = childProcess.execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
+      return output.split(/\r?\n/).map((line) => {
+        const columns = line.trim().split(/\s+/);
+        if (columns.length < 5 || columns[0].toUpperCase() !== "TCP") return null;
+        const local = columns[1] || "";
+        const state = columns[3] || "";
+        const pid = Number(columns[4]);
+        return local.endsWith(`:${ADAPTER_PORT}`) && state.toUpperCase() === "LISTENING" ? pid : null;
+      }).filter((pid) => Number.isInteger(pid) && pid > 0);
+    }
+    const output = childProcess.execFileSync("lsof", ["-nP", `-iTCP:${ADAPTER_PORT}`, "-sTCP:LISTEN", "-t"], { encoding: "utf8" });
+    return output.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0);
+  } catch {
+    return [];
+  }
+}
+
+function commandForPid(pid) {
+  try {
+    if (process.platform === "win32") {
+      const command = `(Get-CimInstance Win32_Process -Filter "ProcessId = ${Number(pid)}").CommandLine`;
+      return childProcess.execFileSync("powershell.exe", ["-NoProfile", "-Command", command], { encoding: "utf8" }).trim();
+    }
+    return childProcess.execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function isLikelyOwnedAdapterProcess(pid) {
+  const command = commandForPid(pid);
+  return command.includes("mimo2codex") && command.includes(ADAPTER_DATA_DIR);
+}
+
+async function waitForPortClosed(port, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!await canConnect(port, 180)) return true;
+    await delay(120);
+  }
+  return !await canConnect(port, 180);
+}
+
+async function cleanupOwnedAdapterPort(reason) {
+  const pids = adapterPortPids().filter(isLikelyOwnedAdapterProcess);
+  for (const pid of pids) {
+    await terminatePid(pid, reason);
+  }
+  if (pids.length) await waitForPortClosed(ADAPTER_PORT);
+}
+
+async function stopAdapter(reason = "stop") {
+  const pids = new Set();
+  if (adapter?.process?.pid) pids.add(adapter.process.pid);
+  const trackedPid = readAdapterPid();
+  if (trackedPid) pids.add(trackedPid);
   adapter = null;
   adapterKey = null;
+  for (const pid of pids) {
+    await terminatePid(pid, reason);
+  }
+  removeAdapterPid();
+  await cleanupOwnedAdapterPort(reason);
+  await waitForPortClosed(ADAPTER_PORT);
 }
 
 function canConnect(port, timeoutMs = 400) {
@@ -1026,16 +1154,30 @@ async function waitForPort(port, timeoutMs = 6500) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await canConnect(port)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await delay(150);
+  }
+  return false;
+}
+
+async function waitForAdapterStart(child, port, timeoutMs = 6500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!adapterProcessAlive(child)) return false;
+    if (await canConnect(port)) return true;
+    await delay(150);
   }
   return false;
 }
 
 async function ensureAdapter(provider) {
   const sig = adapterSignature(provider);
-  if (adapter?.process && !adapter.process.killed && adapterKey === sig && await canConnect(ADAPTER_PORT)) return;
-  stopAdapter();
+  if (adapterProcessAlive(adapter?.process) && adapterKey === sig && await canConnect(ADAPTER_PORT)) return;
+  await stopAdapter("provider_switch");
   assertProviderBaseUrl(provider);
+  await cleanupOwnedAdapterPort("before_start");
+  if (await canConnect(ADAPTER_PORT)) {
+    throw new Error(`Adapter port ${ADAPTER_PORT} is already used by another process. Stop that process, then try again.`);
+  }
   const cli = findMimo2CodexCli();
   if (!cli) throw new Error("mimo2codex is not installed. Run npm install in codex-provider-hub.");
   ensureDir(ADAPTER_DATA_DIR);
@@ -1072,9 +1214,17 @@ async function ensureAdapter(provider) {
   });
   adapter = { process: child, providerId: provider.id, authToken: adapterAuthToken };
   adapterKey = sig;
+  writeAdapterPid(child.pid);
   appendLog("adapter started", { provider: provider.id, pid: child.pid });
-  child.on("exit", (code, signal) => appendLog("adapter exited", { provider: provider.id, code, signal }));
-  if (!await waitForPort(ADAPTER_PORT)) {
+  child.on("exit", (code, signal) => {
+    appendLog("adapter exited", { provider: provider.id, code, signal });
+    if (adapter?.process === child) {
+      adapter = null;
+      adapterKey = null;
+    }
+    removeAdapterPid(child.pid);
+  });
+  if (!await waitForAdapterStart(child, ADAPTER_PORT)) {
     throw new Error(`mimo2codex adapter did not start on ${ADAPTER_PORT}. Check ${path.join(DATA_DIR, "adapter.err.log")}`);
   }
 }
@@ -1372,15 +1522,21 @@ function sendJson(res, status, payload) {
 async function statusPayload() {
   const config = loadConfig();
   const provider = providerById(config);
+  const adapterRunning = config.gatewayEnabled === true &&
+    provider?.type !== "responses" &&
+    adapter?.providerId === provider?.id &&
+    adapterProcessAlive(adapter?.process) &&
+    await canConnect(ADAPTER_PORT);
   return {
     appId: APP_ID,
+    appVersion: APP_VERSION,
     apiUrl: `http://${API_HOST}:${API_PORT}/v1`,
     uiUrl: `http://${API_HOST}:${UI_PORT}`,
     dataDir: DATA_DIR,
     activeProvider: config.activeProvider,
     activeProviderDisplayName: provider?.displayName || config.activeProvider,
     gatewayEnabled: config.gatewayEnabled === true,
-    adapterRunning: !!(adapter?.process && !adapter.process.killed) && await canConnect(ADAPTER_PORT),
+    adapterRunning,
     providers: config.providers.map(redactedProvider),
     localSearch: config.localSearch,
     gateway: config.gateway,
@@ -1456,6 +1612,7 @@ async function handleApi(req, res) {
     const body = await readJsonBody(req);
     if (body.enabled === false) {
       const backupPath = disableProxyMode();
+      await stopAdapter("gateway_disabled");
       sendJson(res, 200, { ok: true, enabled: false, message: "代理已关闭：Codex 配置已恢复官方 OpenAI。若 Codex 仍在使用旧连接，重启一次 Codex 即可回到官方模式。", backupPath });
       return;
     }
@@ -1497,7 +1654,7 @@ async function handleApi(req, res) {
       config.activeProvider = provider.id;
       saveConfig(config);
       await prepareProviderForSwitch(provider);
-      if (provider.type === "responses") stopAdapter();
+      if (provider.type === "responses") await stopAdapter("responses_provider");
       if (!wasGatewayEnabled) enableProxyMode();
     } catch (error) {
       const rollback = loadConfig();
@@ -1712,6 +1869,7 @@ async function api(path, opts={}){
   const headers={authorization:'Bearer '+AUTH_TOKEN,...(opts.headers||{})};
   const attempts=opts.retry===false?1:4;
   let lastError=null;
+  let lastRetryable=false;
   for(let i=0;i<attempts;i++){
     try{
       const res=await fetch(path,{cache:'no-store',...opts,headers});
@@ -1720,19 +1878,20 @@ async function api(path, opts={}){
       try{ data=text?JSON.parse(text):{}; }catch{ data={ message:text||'request failed' }; }
       if(res.status===401&&IS_DESKTOP){ setTimeout(()=>location.reload(),300); throw new Error('本地鉴权已刷新，正在重载控制台...'); }
       if(!res.ok||data.ok===false) throw new Error(data.message||data.error?.message||'request failed');
+      if(reconnecting){ toast('Hub 连接已恢复。'); }
       reconnecting=false;
       return data;
     }catch(error){
       lastError=error;
       const message=String(error?.message||error||'');
       const retryable=message.includes('Failed to fetch')||message.includes('NetworkError')||message.includes('Load failed')||message.includes('request failed');
+      lastRetryable=retryable;
       if(!retryable||i===attempts-1) break;
-      if(!reconnecting){ reconnecting=true; toast('Hub 连接中断，正在自动重连...'); }
       await sleep(350*(i+1));
     }
   }
-  if(IS_DESKTOP&&reconnecting){
-    toast('Hub 正在恢复，控制台即将自动刷新。');
+  if(IS_DESKTOP&&lastRetryable){
+    if(!reconnecting){ reconnecting=true; toast('Hub 连接中断，正在自动重连...'); }
     setTimeout(()=>location.reload(),1200);
   }
   throw lastError||new Error('request failed');
@@ -1892,8 +2051,14 @@ const uiServer = http.createServer(async (req, res) => {
   }
 });
 
-process.on("SIGINT", () => { stopAdapter(); removeHubPid(); process.exit(0); });
-process.on("SIGTERM", () => { stopAdapter(); removeHubPid(); process.exit(0); });
+async function shutdown() {
+  await stopAdapter("hub_shutdown");
+  removeHubPid();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => { shutdown(); });
+process.on("SIGTERM", () => { shutdown(); });
 
 loadConfig();
 ensureProxyMode();
